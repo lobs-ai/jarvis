@@ -5,7 +5,8 @@ import { join, extname, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import Anthropic from "@anthropic-ai/sdk";
 import { WhisperStt, ChatterboxTts } from "@jarvis/voice";
-import { loadConfig } from "./config.js";
+import { SettingsPatch, type SettingsSnapshot } from "@jarvis/protocol";
+import { loadConfig, saveConfig } from "./config.js";
 import { MemoryStore } from "./memory/store.js";
 import { Session } from "./session.js";
 import { StageSocket } from "./ws.js";
@@ -36,6 +37,10 @@ const CLI_ALLOWED = [
   "mcp__wiki__wiki_propose_edit",
   "mcp__browser__browser_open",
   "mcp__browser__browser_read",
+  // Jarvis may adjust its own settings (both route through jarvisd's HTTP
+  // control endpoint, so the stage sees every change immediately)
+  "mcp__settings__settings_get",
+  "mcp__settings__settings_set",
 ];
 const CLI_DISALLOWED = [
   // file editing stays out — Jarvis is not a coding agent; the wiki gate would
@@ -86,15 +91,18 @@ async function main(): Promise<void> {
 
   const mcp = new McpManager();
 
+  // The wiki server resolves its directory per call from ~/.jarvis/config.toml
+  // (no env pin), so a settings change moves the wiki without any restart.
   const servers: McpServerSpec[] = [
-    {
-      name: "wiki",
-      command: TSX,
-      args: [join(REPO_ROOT, "servers/wiki/src/index.ts")],
-      env: { JARVIS_WIKI_DIR: cfg.wiki_dir },
-    },
+    { name: "wiki", command: TSX, args: [join(REPO_ROOT, "servers/wiki/src/index.ts")] },
     { name: "terminal", command: TSX, args: [join(REPO_ROOT, "servers/terminal/src/index.ts")] },
     { name: "browser", command: TSX, args: [join(REPO_ROOT, "servers/browser/src/index.ts")] },
+    {
+      name: "settings",
+      command: TSX,
+      args: [join(REPO_ROOT, "servers/settings/src/index.ts")],
+      env: { JARVIS_PORT: String(cfg.port) },
+    },
   ];
   // The speech server exists ONLY for the CLI child: say is how the model
   // speaks there (jarvisd streams its input text; the server just acks).
@@ -131,6 +139,8 @@ async function main(): Promise<void> {
   if (useCli) {
     brain = new CliBrain({
       model: cfg.model_tier1,
+      thinking: cfg.thinking,
+      wikiDir: () => cfg.wiki_dir,
       servers: cliServers,
       allowedTools: CLI_ALLOWED,
       disallowedTools: CLI_DISALLOWED,
@@ -155,6 +165,77 @@ async function main(): Promise<void> {
   const session = new Session(brain, sock, store, null, null);
   sock.bind(session);
   session.attachMcp(mcp, confirm);
+
+  // ── Settings control plane ─────────────────────────────────────
+  // jarvisd is the single writer: the stage panel (WS), the settings MCP
+  // server (HTTP), and curl all land in applySettings. Wiki moves apply live
+  // (the wiki server re-reads config per call); model/thinking are baked into
+  // the CLI child, so they restart the conversation — deferred to turn end
+  // when Jarvis changes them on itself mid-turn.
+  const currentSettings = (): SettingsSnapshot => ({
+    wiki_dir: cfg.wiki_dir,
+    model_tier1: cfg.model_tier1,
+    model_tier2: cfg.model_tier2,
+    thinking: cfg.thinking,
+  });
+
+  let brainRestartPending = false;
+  const restartBrain = (): void => {
+    brain.reset?.();
+    sock.sendSessionReset();
+  };
+  session.onIdle = () => {
+    if (!brainRestartPending) return;
+    brainRestartPending = false;
+    restartBrain();
+  };
+
+  const applySettings = (raw: unknown): { settings: SettingsSnapshot; note?: string } => {
+    const patch = SettingsPatch.parse(raw);
+    saveConfig(patch);
+    const notes: string[] = [];
+    if (patch.wiki_dir && patch.wiki_dir !== cfg.wiki_dir) {
+      cfg.wiki_dir = patch.wiki_dir;
+      notes.push(`wiki → ${patch.wiki_dir}`);
+    }
+    if (patch.model_tier2 && patch.model_tier2 !== cfg.model_tier2) {
+      cfg.model_tier2 = patch.model_tier2;
+      notes.push(`tier-2 → ${patch.model_tier2}`);
+    }
+    const brainChanged =
+      (patch.model_tier1 && patch.model_tier1 !== cfg.model_tier1) ||
+      (patch.thinking && patch.thinking !== cfg.thinking);
+    if (brainChanged) {
+      if (patch.model_tier1) cfg.model_tier1 = patch.model_tier1;
+      if (patch.thinking) cfg.thinking = patch.thinking;
+      brain.configure?.({ model: cfg.model_tier1, thinking: cfg.thinking });
+      if (session.isActive()) {
+        brainRestartPending = true;
+        notes.push(`${cfg.model_tier1}, thinking ${cfg.thinking} — fresh conversation when this turn ends`);
+      } else {
+        restartBrain();
+        notes.push(`${cfg.model_tier1}, thinking ${cfg.thinking} — fresh conversation`);
+      }
+    }
+    const result = { settings: currentSettings(), note: notes.join(" · ") || undefined };
+    sock.sendSettings(result.settings, result.note);
+    return result;
+  };
+
+  sock.onConnect = () => sock.sendSettings(currentSettings());
+  sock.onSettingsGet = () => sock.sendSettings(currentSettings());
+  sock.onSettingsSet = (patch) => {
+    try {
+      applySettings(patch);
+    } catch (err) {
+      sock.sendWarning(`settings rejected: ${String(err)}`);
+    }
+  };
+  sock.onSessionNew = () => {
+    session.resetConversation();
+    brainRestartPending = false; // the reset already delivered any pending change
+    sock.sendSessionReset();
+  };
 
   // Voice ports: degrade gracefully if a sidecar is down (captions carry the turn).
   const stt = new WhisperStt(cfg.stt_url);
@@ -248,6 +329,34 @@ async function main(): Promise<void> {
     if (url === "/healthz") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    // Settings control endpoint (localhost-only): GET reads, POST applies a
+    // patch. The settings MCP server rides this, so Jarvis's own changes flow
+    // through the same single writer as the stage panel.
+    if (url === "/settings") {
+      if (req.method === "GET") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(currentSettings()));
+        return;
+      }
+      if (req.method === "POST") {
+        let body = "";
+        req.on("data", (c: Buffer) => (body += c.toString()));
+        req.on("end", () => {
+          try {
+            const result = applySettings(JSON.parse(body || "{}"));
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: String(err) }));
+          }
+        });
+        return;
+      }
+      res.writeHead(405);
+      res.end("GET or POST");
       return;
     }
     // Exhibit ref resolver: <show ref="wiki:PATH"/> → the stage fetches here.

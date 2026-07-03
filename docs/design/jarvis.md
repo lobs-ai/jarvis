@@ -309,6 +309,26 @@ drives turns + the performance layer, not history). Two ship, **CLI is the defau
   built-ins (`Edit`/`Write`/`NotebookEdit`) stay disallowed so the wiki propose→confirm→commit
   gate can't be bypassed. The API path gets parity via a `terminal_run` MCP tool (fresh `zsh -lc`
   subshell, 30s timeout, output cap) classified `navigate` — narrate-then-act, no confirm.
+
+  **Settings + self-reconfiguration (2026-07-03).** Runtime-adjustable settings live in
+  `~/.jarvis/config.toml`: `wiki_dir`, `model_tier1`, `model_tier2`, `thinking`
+  (off/low/medium/high → `MAX_THINKING_TOKENS` 0/4096/16384/32768 in the child env). jarvisd is
+  the **single writer**; three surfaces funnel into one `applySettings`: the stage's ⚙ panel
+  (WS `settings.get`/`settings.set`), plain HTTP (`GET`/`POST /settings`, localhost), and a
+  `settings` MCP server whose `settings_get`/`settings_set` tools call that same HTTP endpoint —
+  which is how *Jarvis changes its own settings*. Every change is pushed back to the stage as a
+  `settings` message with a human note, whoever made it. Apply semantics differ by key:
+  `wiki_dir` applies **live** (the wiki server re-resolves its root on every call — env override
+  for tests, else config.toml, else `~/wiki`; diff temp files moved to the OS tmpdir since the
+  wiki may be a repo *subdir* with no `.git`, e.g. `~/other/personal-wiki/wiki`); `model_tier1`/
+  `thinking` are baked into the child's spawn args, so they trigger `CliBrain.reset()` — kill the
+  warm child, respawn on next turn = **fresh conversation** — deferred to turn end
+  (`session.onIdle`) when Jarvis flips them on itself mid-turn. `settings_set` is `navigate`-class
+  (drain speech, no confirm) and the prompt norm is "only change settings when Rafe asks."
+  The stage also grew a ✚ **new conversation** button (WS `session.new` → `Session.
+  resetConversation()` → `session.reset` broadcast clears transcript + exhibits). Claude Code
+  emits `system/init` once per *query*, not per process — `test-continuity.mts` proves history
+  survives across turns in one child.
 - **`ApiBrain` — Anthropic SDK fallback** (used only when the CLI is absent or `JARVIS_BRAIN=api`).
   jarvisd owns the loop, tool execution, tier-2, and built-ins, as described below.
 
@@ -675,6 +695,15 @@ deliberately. A well-formed `ref` that fails to resolve (server absent, page mis
 a placeholder exhibit naming the miss plus a caption warning — distinct from the
 malformed-markup rule, and never spoken. Payload text inside a tag is never spoken. Prose
 outside tags is spoken and captioned exactly as written.
+
+**Rich rendering (2026-07-03).** Markdown exhibits render through `apps/stage/src/render.ts`:
+fenced code is syntax-highlighted (highlight.js core, ~11 registered languages, token colors
+in the stage palette) and ` ```mermaid ` fences render to live SVG diagrams (mermaid v11,
+dark theme mapped to stage colors: flowchart, sequence, state, pie, xychart-beta bar/line
+charts, timeline, mindmap, gantt). Diagrams hydrate asynchronously after the exhibit conjures;
+a parse failure keeps the source visible with the error beneath it, never blanks the card.
+`code`-type exhibits honor their `lang` attribute, including `lang="mermaid"`. The prompt's
+markup section tells the model to reach for a diagram when structure beats prose.
 
 **Standing rules (the system-prompt spine).**
 1. Narrate what you show, as you show it — place a `<show>` at the exact point in your prose

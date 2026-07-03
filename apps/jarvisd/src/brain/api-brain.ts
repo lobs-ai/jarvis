@@ -12,9 +12,17 @@ export class ApiBrain implements BrainPort {
 
   constructor(
     private readonly client: Anthropic,
-    private readonly model: string,
+    private model: string,
     private readonly facts: () => string | null,
   ) {}
+
+  configure(patch: { model?: string }): void {
+    if (patch.model) this.model = patch.model;
+  }
+
+  reset(): void {
+    this.history = [];
+  }
 
   setTools(tools: ToolDef[], executor: ToolExecutor): void {
     this.tools = tools;

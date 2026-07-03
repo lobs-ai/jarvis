@@ -6,6 +6,8 @@ import {
   decodeBinaryFrame,
   type ServerMessage,
   type PerformanceItem,
+  type SettingsPatch,
+  type SettingsSnapshot,
 } from "@jarvis/protocol";
 import type { Session, SessionSink } from "./session.js";
 
@@ -27,6 +29,7 @@ export class StageSocket implements SessionSink {
         if (this.ws === ws) this.ws = null;
       });
       this.sendState("idle");
+      this.onConnect?.();
     });
   }
 
@@ -77,11 +80,25 @@ export class StageSocket implements SessionSink {
       case "confirm":
         this.onConfirm?.(msg.confirmId, msg.approve);
         break;
+      case "session.new":
+        this.onSessionNew?.();
+        break;
+      case "settings.get":
+        this.onSettingsGet?.();
+        break;
+      case "settings.set":
+        this.onSettingsSet?.(msg.patch);
+        break;
     }
   }
 
   // wired by the confirmation broker (M2+ wiki commits, M4 mutate acts)
   onConfirm: ((confirmId: string, approve: boolean) => void) | null = null;
+  // wired by main: settings + conversation lifecycle (jarvisd owns both)
+  onConnect: (() => void) | null = null;
+  onSessionNew: (() => void) | null = null;
+  onSettingsGet: (() => void) | null = null;
+  onSettingsSet: ((patch: SettingsPatch) => void) | null = null;
 
   private send(msg: ServerMessage): void {
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
@@ -144,5 +161,13 @@ export class StageSocket implements SessionSink {
 
   sendConfirmResolved(confirmId: string, approved: boolean): void {
     this.send({ type: "confirm.resolved", confirmId, approved });
+  }
+
+  sendSessionReset(): void {
+    this.send({ type: "session.reset" });
+  }
+
+  sendSettings(settings: SettingsSnapshot, note?: string): void {
+    this.send({ type: "settings", settings, note });
   }
 }

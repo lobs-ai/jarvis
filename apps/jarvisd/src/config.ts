@@ -1,7 +1,7 @@
-import { readFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { parse as parseToml } from "smol-toml";
+import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { z } from "zod";
 
 export const JARVIS_HOME = join(homedir(), ".jarvis");
@@ -10,6 +10,8 @@ const ConfigSchema = z.object({
   port: z.number().int().default(7430),
   model_tier1: z.string().default("claude-opus-4-8"), // Rafe's call: opus over sonnet's latency edge
   model_tier2: z.string().default("claude-fable-5"),
+  // extended-thinking budget for tier-1 (off measured 9s→2s ttft on opus)
+  thinking: z.enum(["off", "low", "medium", "high"]).default("off"),
   stt_url: z.string().default("http://127.0.0.1:7423"),
   tts_url: z.string().default("http://127.0.0.1:7422"),
   tts_voice: z.string().default("default"),
@@ -39,6 +41,18 @@ export function loadConfig(): Config {
   const tomlPath = join(JARVIS_HOME, "config.toml");
   const raw = existsSync(tomlPath) ? parseToml(readFileSync(tomlPath, "utf8")) : {};
   return ConfigSchema.parse(raw);
+}
+
+// Persist a settings patch. jarvisd is the single writer; the stage panel, the
+// HTTP control endpoints, and the settings MCP server all funnel through here.
+// Unknown keys already in the file survive; comments don't (smol-toml rewrite).
+export function saveConfig(patch: Record<string, unknown>): void {
+  const tomlPath = join(JARVIS_HOME, "config.toml");
+  const raw = existsSync(tomlPath) ? parseToml(readFileSync(tomlPath, "utf8")) : {};
+  const defined = Object.fromEntries(
+    Object.entries(patch).filter(([, v]) => v !== undefined),
+  );
+  writeFileSync(tomlPath, stringifyToml({ ...raw, ...defined }) + "\n");
 }
 
 export function requireApiKey(): string {

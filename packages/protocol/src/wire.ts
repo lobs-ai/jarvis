@@ -1,6 +1,27 @@
 import { z } from "zod";
 import { PerformanceItem } from "./performance.js";
 
+// Runtime-adjustable settings, shared by the stage UI, jarvisd's HTTP control
+// endpoints, and the settings MCP server — one schema, one writer (jarvisd).
+export const ThinkingLevel = z.enum(["off", "low", "medium", "high"]);
+export type ThinkingLevel = z.infer<typeof ThinkingLevel>;
+
+export const SettingsPatch = z.object({
+  wiki_dir: z.string().min(1).optional(),
+  model_tier1: z.string().min(1).optional(),
+  model_tier2: z.string().min(1).optional(),
+  thinking: ThinkingLevel.optional(),
+});
+export type SettingsPatch = z.infer<typeof SettingsPatch>;
+
+export const SettingsSnapshot = z.object({
+  wiki_dir: z.string(),
+  model_tier1: z.string(),
+  model_tier2: z.string(),
+  thinking: ThinkingLevel,
+});
+export type SettingsSnapshot = z.infer<typeof SettingsSnapshot>;
+
 // stage → jarvisd
 export const ClientMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("hello"), quiet: z.boolean().default(false) }),
@@ -16,6 +37,10 @@ export const ClientMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("played"), turnId: z.string(), seq: z.number().int() }),
   // click-confirm for a pending mutate act or wiki commit
   z.object({ type: z.literal("confirm"), confirmId: z.string(), approve: z.boolean() }),
+  // drop the brain's conversation history and start fresh
+  z.object({ type: z.literal("session.new") }),
+  z.object({ type: z.literal("settings.get") }),
+  z.object({ type: z.literal("settings.set"), patch: SettingsPatch }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
 
@@ -58,6 +83,11 @@ export const ServerMessage = z.discriminatedUnion("type", [
   }),
   z.object({ type: z.literal("confirm.resolved"), confirmId: z.string(), approved: z.boolean() }),
   z.object({ type: z.literal("error"), message: z.string(), detail: z.string().optional() }),
+  // conversation was reset (via UI button or settings change) — clear the room
+  z.object({ type: z.literal("session.reset") }),
+  // current settings; pushed on connect and after every change, whoever made it
+  // (stage panel, HTTP, or Jarvis itself through the settings MCP server)
+  z.object({ type: z.literal("settings"), settings: SettingsSnapshot, note: z.string().optional() }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessage>;
 

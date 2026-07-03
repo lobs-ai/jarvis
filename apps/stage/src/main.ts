@@ -1,4 +1,9 @@
-import { encodeBinaryFrame, type OrbState } from "@jarvis/protocol";
+import {
+  encodeBinaryFrame,
+  type OrbState,
+  type SettingsPatch,
+  type SettingsSnapshot,
+} from "@jarvis/protocol";
 import { Wire } from "./wire.js";
 import { Exhibits } from "./exhibits.js";
 import { Player } from "./audio/player.js";
@@ -123,6 +128,58 @@ async function toggleMic(): Promise<void> {
 
 micToggle.addEventListener("click", () => void toggleMic());
 
+// ── settings panel + new conversation ────────────────────────
+const settingsPanel = $("#settingsPanel");
+const settingsToggle = $<HTMLButtonElement>("#settingsToggle");
+const newConvo = $<HTMLButtonElement>("#newConvo");
+const setModel = $<HTMLSelectElement>("#setModel");
+const setThinking = $<HTMLSelectElement>("#setThinking");
+const setWiki = $<HTMLInputElement>("#setWiki");
+const setApply = $<HTMLButtonElement>("#setApply");
+let settings: SettingsSnapshot | null = null;
+
+function showSettings(s: SettingsSnapshot): void {
+  settings = s;
+  // a model outside the preset list (config-file edits, future models) still shows
+  if (![...setModel.options].some((o) => o.value === s.model_tier1)) {
+    const opt = document.createElement("option");
+    opt.value = s.model_tier1;
+    opt.textContent = s.model_tier1;
+    setModel.appendChild(opt);
+  }
+  setModel.value = s.model_tier1;
+  setThinking.value = s.thinking;
+  setWiki.value = s.wiki_dir;
+}
+
+settingsToggle.addEventListener("click", () => settingsPanel.classList.toggle("hidden"));
+
+setApply.addEventListener("click", () => {
+  if (!settings) return;
+  const patch: SettingsPatch = {};
+  if (setModel.value !== settings.model_tier1) patch.model_tier1 = setModel.value;
+  if (setThinking.value !== settings.thinking)
+    patch.thinking = setThinking.value as SettingsPatch["thinking"];
+  const wiki = setWiki.value.trim();
+  if (wiki && wiki !== settings.wiki_dir) patch.wiki_dir = wiki;
+  if (Object.keys(patch).length > 0) wire.send({ type: "settings.set", patch });
+  settingsPanel.classList.add("hidden");
+});
+
+newConvo.addEventListener("click", () => {
+  if (player.isPlaying) player.flush();
+  wire.send({ type: "session.new" });
+});
+
+function clearRoom(): void {
+  transcript.replaceChildren();
+  thoughtLines.clear();
+  currentJarvisLine = null;
+  currentTurnId = null;
+  exhibits.dismiss("", "all");
+  addLine("sys", "— new conversation —");
+}
+
 function interruptPerformance(): void {
   player.flush();
   wire.send({ type: "interrupt" });
@@ -224,6 +281,13 @@ const wire = new Wire({
           .forEach((el) => el.remove());
         return;
       }
+      case "session.reset":
+        clearRoom();
+        return;
+      case "settings":
+        showSettings(msg.settings);
+        if (msg.note) addLine("sys", `settings: ${msg.note}`);
+        return;
       case "error":
         addLine("warn", msg.message);
         return;

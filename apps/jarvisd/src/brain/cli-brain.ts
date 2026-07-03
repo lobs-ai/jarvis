@@ -34,6 +34,9 @@ export interface CliServerSpec {
 export interface CliBrainOptions {
   binary?: string;
   model: string;
+  thinking?: ThinkingLevel;
+  // read at child spawn so a wiki move lands in the prompt after a reset
+  wikiDir?: () => string;
   servers: CliServerSpec[];
   // Tools Claude Code may call directly (say, shell, reads, wiki proposals).
   // Mutating wiki/browser tools are excluded — jarvisd gates those (design §Security).
@@ -43,6 +46,17 @@ export interface CliBrainOptions {
   onToolResult?: (name: string, text: string) => void;
   facts: () => string | null;
 }
+
+type ThinkingLevel = "off" | "low" | "medium" | "high";
+
+// Claude Code reads MAX_THINKING_TOKENS from the child env; 0 disables
+// extended thinking entirely (opus defaults it ON — measured ~9s dead air).
+const THINKING_TOKENS: Record<ThinkingLevel, string> = {
+  off: "0",
+  low: "4096",
+  medium: "16384",
+  high: "32768",
+};
 
 interface ActiveTurn {
   cb: BrainCallbacks;
@@ -69,8 +83,15 @@ export class CliBrain implements BrainPort {
   private toolNames = new Map<string, string>();
   private sayIndex: number | null = null; // content-block index of an in-flight say
   private sayExtractor: SayTextExtractor | null = null;
+  private readyLogged = false;
+  // settings-mutable; baked into the child at spawn, so changes need reset()
+  private model: string;
+  private thinking: ThinkingLevel;
 
-  constructor(private readonly opts: CliBrainOptions) {}
+  constructor(private readonly opts: CliBrainOptions) {
+    this.model = opts.model;
+    this.thinking = opts.thinking ?? "off";
+  }
 
   private ensureChild(): ChildProcessWithoutNullStreams {
     if (this.child && !this.child.killed) return this.child;
@@ -88,7 +109,7 @@ export class CliBrain implements BrainPort {
         ]),
       ),
     };
-    const model = MODEL_ALIAS[this.opts.model] ?? this.opts.model;
+    const model = MODEL_ALIAS[this.model] ?? this.model;
     const args = [
       "-p",
       "--input-format", "stream-json",
@@ -98,7 +119,7 @@ export class CliBrain implements BrainPort {
       "--setting-sources", "user",
       "--permission-mode", "bypassPermissions",
       "--model", model,
-      "--append-system-prompt", CLI_PREAMBLE + buildSystemPrompt("say-tool"),
+      "--append-system-prompt", CLI_PREAMBLE + buildSystemPrompt("say-tool", this.opts.wikiDir?.()),
       "--mcp-config", JSON.stringify(mcpConfig),
       "--strict-mcp-config",
       "--allowedTools", this.opts.allowedTools.join(","),
@@ -109,16 +130,16 @@ export class CliBrain implements BrainPort {
     for (const [k, v] of Object.entries(process.env)) {
       if (typeof v === "string" && !CLEAR_ENV.includes(k)) env[k] = v;
     }
-    // Tier-1 runs thinking OFF (design §Brain): Claude Code defaults opus to
-    // extended thinking, which measured ~9s of dead air before the first
-    // visible event. JARVIS_THINKING=1 re-enables it (deltas stream into the
-    // stage's thought line either way).
-    if (!process.env.JARVIS_THINKING) env.MAX_THINKING_TOKENS = "0";
+    // Thinking budget comes from settings (default off — design §Brain: Claude
+    // Code defaults opus to extended thinking, measured ~9s of dead air).
+    // Deltas stream into the stage's thought line when it's on.
+    env.MAX_THINKING_TOKENS = THINKING_TOKENS[this.thinking];
 
     const child = spawn(this.opts.binary ?? "claude", args, {
       env,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    this.readyLogged = false; // a genuinely new child announces itself once
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => this.onStdout(chunk));
     child.stderr.setEncoding("utf8");
@@ -248,9 +269,15 @@ export class CliBrain implements BrainPort {
     }
 
     // startup + failure visibility: init tells us the child is actually up;
-    // an error-subtyped result would otherwise vanish into the discard path
+    // an error-subtyped result would otherwise vanish into the discard path.
+    // Claude Code emits system/init once per QUERY, not per process — log only
+    // the first, or the line reads like a per-turn respawn (it isn't; verified
+    // by test-continuity.mts).
     if (type === "system" && e.subtype === "init") {
-      console.log(`[cli-brain] child ready (model ${(e as { model?: string }).model ?? "?"})`);
+      if (!this.readyLogged) {
+        this.readyLogged = true;
+        console.log(`[cli-brain] child ready (model ${(e as { model?: string }).model ?? "?"})`);
+      }
     } else if (type === "result" && typeof e.subtype === "string" && e.subtype !== "success") {
       console.error(`[cli-brain] result ${e.subtype}: ${String(e.result ?? "").slice(0, 200)}`);
     }
@@ -348,6 +375,27 @@ export class CliBrain implements BrainPort {
     // Claude Code owns history; the process saw its own partial output. The
     // next turn is prefixed with the interruption note by Session, which is
     // enough for the model to reconcile.
+  }
+
+  configure(patch: { model?: string; thinking?: ThinkingLevel }): void {
+    if (patch.model) this.model = patch.model;
+    if (patch.thinking) this.thinking = patch.thinking;
+  }
+
+  // Fresh conversation: kill the warm child (its process IS the history) and
+  // let the next turn spawn a new one with the current model/thinking/prompt.
+  reset(): void {
+    const child = this.child;
+    this.child = null; // detach first so the exit handler can't double-fail
+    if (child && !child.killed) {
+      child.stdin.end();
+      child.kill();
+    }
+    this.failActive();
+    this.toolNames.clear();
+    this.sayIndex = null;
+    this.sayExtractor = null;
+    this.stdoutBuf = "";
   }
 
   dispose(): void {

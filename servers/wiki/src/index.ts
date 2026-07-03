@@ -5,14 +5,29 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, normalize, relative } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-const WIKI_DIR = process.env.JARVIS_WIKI_DIR ?? join(homedir(), "wiki");
+// The wiki location is a live setting: resolved on every call so a
+// settings_set wiki_dir applies without restarting this server or the brain.
+// JARVIS_WIKI_DIR pins it (tests); otherwise ~/.jarvis/config.toml rules.
+const CONFIG_PATH = join(homedir(), ".jarvis", "config.toml");
+
+function wikiDir(): string {
+  if (process.env.JARVIS_WIKI_DIR) return process.env.JARVIS_WIKI_DIR;
+  try {
+    // one string key out of a small toml — a parser dependency isn't worth it
+    const m = readFileSync(CONFIG_PATH, "utf8").match(/^\s*wiki_dir\s*=\s*"(.+)"\s*$/m);
+    if (m) return JSON.parse(`"${m[1]!}"`) as string; // unescape toml basic string
+  } catch {
+    /* no config yet — fall through to the default */
+  }
+  return join(homedir(), "wiki");
+}
 
 interface Proposal {
   path: string; // repo-relative, e.g. "projects/jarvis.md"
@@ -24,8 +39,9 @@ interface Proposal {
 const proposals = new Map<string, Proposal>();
 
 function abs(relPath: string): string {
-  const p = normalize(join(WIKI_DIR, relPath));
-  if (!p.startsWith(WIKI_DIR)) throw new Error("path escapes the wiki");
+  const root = wikiDir();
+  const p = normalize(join(root, relPath));
+  if (!p.startsWith(root)) throw new Error("path escapes the wiki");
   return p;
 }
 
@@ -34,27 +50,30 @@ function hashOf(content: string): string {
 }
 
 function listPages(): string[] {
+  const root = wikiDir();
+  if (!existsSync(root)) return [];
   const out: string[] = [];
   const walk = (dir: string): void => {
     for (const name of readdirSync(dir)) {
       if (name.startsWith(".")) continue;
       const p = join(dir, name);
       if (statSync(p).isDirectory()) walk(p);
-      else if (name.endsWith(".md")) out.push(relative(WIKI_DIR, p));
+      else if (name.endsWith(".md")) out.push(relative(root, p));
     }
   };
-  walk(WIKI_DIR);
+  walk(root);
   return out.sort();
 }
 
 function unifiedDiff(path: string, oldText: string, newText: string): string {
-  // git handles the diffing; --no-index compares arbitrary blobs
-  const tmpOld = join(WIKI_DIR, ".git", `old-${randomUUID()}`);
-  const tmpNew = join(WIKI_DIR, ".git", `new-${randomUUID()}`);
+  // git handles the diffing; --no-index compares arbitrary blobs. Temp files
+  // live in the OS tmpdir — the wiki dir may be a subdir of a repo (no .git).
+  const tmpOld = join(tmpdir(), `jarvis-wiki-old-${randomUUID()}`);
+  const tmpNew = join(tmpdir(), `jarvis-wiki-new-${randomUUID()}`);
   writeFileSync(tmpOld, oldText);
   writeFileSync(tmpNew, newText);
   try {
-    execFileSync("git", ["diff", "--no-index", "--", tmpOld, tmpNew], { cwd: WIKI_DIR });
+    execFileSync("git", ["diff", "--no-index", "--", tmpOld, tmpNew]);
     return `(no changes to ${path})`;
   } catch (err) {
     const stdout = (err as { stdout?: Buffer }).stdout?.toString() ?? "";
@@ -68,7 +87,7 @@ function unifiedDiff(path: string, oldText: string, newText: string): string {
   } finally {
     for (const t of [tmpOld, tmpNew]) {
       try {
-        execFileSync("rm", ["-f", t]);
+        rmSync(t, { force: true });
       } catch {
         /* best effort */
       }
@@ -221,8 +240,9 @@ server.tool(
     }
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, prop.newContent);
-    execFileSync("git", ["add", prop.path], { cwd: WIKI_DIR });
-    execFileSync("git", ["commit", "-m", prop.message], { cwd: WIKI_DIR });
+    // cwd works from a repo subdir too — git resolves the repo root upward
+    execFileSync("git", ["add", prop.path], { cwd: wikiDir() });
+    execFileSync("git", ["commit", "-m", prop.message], { cwd: wikiDir() });
     proposals.delete(proposal_id);
     const dangling = lintLinks(prop.newContent);
     const lintNote = dangling.length ? ` (dangling links: ${dangling.join(", ")})` : "";

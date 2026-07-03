@@ -20,6 +20,8 @@ const RISK_REGISTRY: Array<[RegExp, RiskClass]> = [
   // "navigate" still drains speech first, so the pre-command line plays before
   // the command fires; destructive-action asking is a prompt norm, not a gate.
   [/^terminal_run$/, "navigate"],
+  // self-reconfiguration is reversible and announced; drain speech, no gate
+  [/^settings_set$/, "navigate"],
 ];
 
 export function riskOf(tool: string): RiskClass {

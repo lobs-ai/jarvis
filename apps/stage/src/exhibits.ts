@@ -1,5 +1,5 @@
-import { marked } from "marked";
 import type { Exhibit } from "@jarvis/protocol";
+import { renderMarkdown, renderCode, escapeHtml } from "./render.js";
 
 // Exhibit manager: conjure / update / sweep. Ids are namespaced by turn so a
 // model reusing "e1" across turns can't collide.
@@ -82,7 +82,8 @@ export class Exhibits {
       case "markdown":
       case "code":
       case "diff": {
-        if (content) this.renderContent(body, exhibit.type, content);
+        if (content)
+          this.renderContent(body, exhibit.type, content, "lang" in exhibit ? exhibit.lang : undefined);
         else this.placeholder(body, exhibit.ref);
         return;
       }
@@ -98,10 +99,15 @@ export class Exhibits {
     }
   }
 
-  private renderContent(body: HTMLElement, type: "markdown" | "code" | "diff", text: string): void {
-    if (type === "markdown") body.innerHTML = marked.parse(text, { async: false }) as string;
+  private renderContent(
+    body: HTMLElement,
+    type: "markdown" | "code" | "diff",
+    text: string,
+    lang?: string,
+  ): void {
+    if (type === "markdown") renderMarkdown(body, text);
     else if (type === "diff") body.innerHTML = renderDiff(text);
-    else body.innerHTML = `<pre><code>${escapeHtml(text)}</code></pre>`;
+    else renderCode(body, text, lang);
   }
 
   // A well-formed ref that can't resolve yet renders a placeholder naming the
@@ -120,8 +126,4 @@ function renderDiff(text: string): string {
     return esc;
   });
   return `<pre><code>${lines.join("\n")}</code></pre>`;
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }

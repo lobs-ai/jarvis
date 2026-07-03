@@ -69,6 +69,24 @@ export class Session {
     this.drainAnnouncements();
   }
 
+  // Fired when a turn completes cleanly and the channel goes idle. main uses it
+  // to apply deferred brain restarts (model/thinking changes) between turns.
+  onIdle: (() => void) | null = null;
+
+  isActive(): boolean {
+    return this.active !== null;
+  }
+
+  // New conversation: end anything in flight, drop queued announcements, and
+  // let the brain shed its history (CliBrain kills the warm child; a fresh one
+  // spawns on the next turn).
+  resetConversation(): void {
+    if (this.active) this.truncateInterrupted();
+    this.pendingAnnouncements = [];
+    this.brain.reset?.();
+    this.store.append({ at: new Date().toISOString(), kind: "system", text: "conversation reset" });
+  }
+
   private drainAnnouncements(): void {
     if (this.active || this.pendingAnnouncements.length === 0) return;
     const { text, report } = this.pendingAnnouncements.shift()!;
@@ -334,6 +352,7 @@ export class Session {
         this.sink.sendTurnEnd(turnId);
         this.sink.sendState("idle");
         this.drainAnnouncements(); // channel just went idle
+        this.onIdle?.();
       }
     } catch (err) {
       if (thoughtTimer) clearTimeout(thoughtTimer);
