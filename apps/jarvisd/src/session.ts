@@ -21,6 +21,7 @@ export interface SessionSink {
   sendTurnBegin(turnId: string, source: "voice" | "text"): void;
   sendTurnEnd(turnId: string): void;
   sendHeard(turnId: string, text: string): void;
+  sendThought(turnId: string, text: string): void;
 }
 
 interface ActiveTurn {
@@ -137,11 +138,20 @@ export class Session {
       pcm.set(c, off);
       off += c.byteLength;
     }
+    // Energy gate: an open mic sends silence-adjacent utterances, and whisper
+    // HALLUCINATES on those ("[BLANK_AUDIO]", "thank you."). True silence is
+    // dropped quietly — no STT call, no brain turn, no caption spam.
+    const rms = pcm16Rms(pcm);
+    if (rms < RMS_SPEECH_FLOOR) {
+      console.log(`[stt] dropped silent utterance (rms ${rms.toFixed(4)}, ${(total / 32000).toFixed(1)}s)`);
+      this.sink.sendState(this.active ? "speaking" : "idle");
+      return;
+    }
     this.sink.sendState("thinking");
     const t0 = Date.now(); // perceived clock starts at end-of-speech (PTT release)
     let transcript: string;
     try {
-      transcript = (await this.stt.transcribe(pcm)).trim();
+      transcript = stripNonSpeech((await this.stt.transcribe(pcm)).trim());
       console.log(
         `[latency] transcript ${Date.now() - t0}ms (${(pcm.byteLength / 32000).toFixed(1)}s of audio)`,
       );
@@ -270,6 +280,19 @@ export class Session {
     if (source === "voice") this.sink.sendHeard(turnId, userText);
     this.sink.sendState("thinking");
 
+    // Inner monologue: the brain's private workspace + tool markers stream to
+    // the stage as one dim line — silent work must be visibly alive.
+    let thought = "";
+    let thoughtTimer: ReturnType<typeof setTimeout> | null = null;
+    const pushThought = (t: string): void => {
+      thought += t;
+      if (thoughtTimer) return;
+      thoughtTimer = setTimeout(() => {
+        thoughtTimer = null;
+        this.sink.sendThought(turnId, thought.slice(-600).trimStart());
+      }, 250);
+    };
+
     // The bundle (untrusted observed world-state) rides THIS turn only; the
     // brain never accumulates it into history (design §Eyes).
     const bundle = await this.assembleBundle();
@@ -288,10 +311,19 @@ export class Session {
             compiler.push(delta);
             this.sink.sendState("speaking");
           },
-          onToolCall: () => this.sink.sendState("acting"),
+          onToolCall: (name) => {
+            this.sink.sendState("acting");
+            pushThought(`\n› ${name.replace(/^mcp__\w+?__/, "")}\n`);
+          },
+          onThought: pushThought,
         },
         abort.signal,
       );
+      // final thought flush, then stop the timer so nothing lands post-turn
+      if (thoughtTimer) clearTimeout(thoughtTimer);
+      thoughtTimer = null;
+      if (thought.trim()) this.sink.sendThought(turnId, thought.slice(-600).trimStart());
+
       compiler.end();
       queue.endOfItems();
       await queue.whenDone();
@@ -304,6 +336,8 @@ export class Session {
         this.drainAnnouncements(); // channel just went idle
       }
     } catch (err) {
+      if (thoughtTimer) clearTimeout(thoughtTimer);
+      thoughtTimer = null;
       if (this.active?.turnId === turnId) {
         this.active = null;
         // design: Failure UX — one canned apology + caption detail, never silent
@@ -348,6 +382,29 @@ export class Session {
       return out;
     };
   }
+}
+
+// normalized [0,1] RMS of 16-bit PCM; speech with AGC lands ≥ ~0.03
+const RMS_SPEECH_FLOOR = 0.01;
+
+function pcm16Rms(pcm: Uint8Array): number {
+  const view = new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2));
+  if (view.length === 0) return 0;
+  let sum = 0;
+  for (let i = 0; i < view.length; i++) {
+    const s = view[i]! / 32768;
+    sum += s * s;
+  }
+  return Math.sqrt(sum / view.length);
+}
+
+// whisper wraps non-speech in annotations — [BLANK_AUDIO], (soft music), ♪ —
+// which must never reach the brain as if Rafe said them.
+function stripNonSpeech(text: string): string {
+  return text
+    .replace(/\[[^\]]*\]|\([^)]*\)|[♪♫]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function serializeShow(item: Extract<PerformanceItem, { kind: "show" }>): string {

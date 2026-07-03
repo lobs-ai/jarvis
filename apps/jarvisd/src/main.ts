@@ -21,10 +21,16 @@ const STAGE_DIST = fileURLToPath(new URL("../../stage/dist", import.meta.url));
 const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 const TSX = fileURLToPath(new URL("../node_modules/.bin/tsx", import.meta.url));
 
-// Tools Claude Code may call directly on the subscription path (reads + a wiki
-// PROPOSAL). Mutating tools + context tools are withheld: jarvisd gates commits
-// and owns bundle assembly (design §Security).
+// Tools Claude Code may call directly on the subscription path: speech, the
+// shell (Rafe's call — Jarvis runs what it needs to run; destructive-action
+// asking is a prompt norm), web, reads, and a wiki PROPOSAL. Mutating tools +
+// context tools are withheld: jarvisd gates commits and owns bundle assembly
+// (design §Security).
 const CLI_ALLOWED = [
+  "mcp__speech__say",
+  "Bash",
+  "WebSearch",
+  "WebFetch",
   "mcp__wiki__wiki_search",
   "mcp__wiki__wiki_read",
   "mcp__wiki__wiki_propose_edit",
@@ -32,6 +38,13 @@ const CLI_ALLOWED = [
   "mcp__browser__browser_read",
 ];
 const CLI_DISALLOWED = [
+  // file editing stays out — Jarvis is not a coding agent; the wiki gate would
+  // be meaningless if Edit/Write could touch ~/wiki directly
+  "Edit",
+  "Write",
+  "NotebookEdit",
+  "TodoWrite",
+  "mcp__terminal__terminal_run", // Claude Code's own Bash is the shell here
   "mcp__wiki__wiki_commit",
   "mcp__wiki__wiki_context",
   "mcp__terminal__terminal_context",
@@ -83,6 +96,13 @@ async function main(): Promise<void> {
     { name: "terminal", command: TSX, args: [join(REPO_ROOT, "servers/terminal/src/index.ts")] },
     { name: "browser", command: TSX, args: [join(REPO_ROOT, "servers/browser/src/index.ts")] },
   ];
+  // The speech server exists ONLY for the CLI child: say is how the model
+  // speaks there (jarvisd streams its input text; the server just acks).
+  // jarvisd's own McpManager and the API brain must never see it.
+  const cliServers: McpServerSpec[] = [
+    ...servers,
+    { name: "speech", command: TSX, args: [join(REPO_ROOT, "servers/speech/src/index.ts")] },
+  ];
 
   // Brain selection: prefer Rafe's Claude Code subscription (CliBrain); fall
   // back to the Anthropic SDK only if the CLI is unavailable or JARVIS_BRAIN=api.
@@ -111,7 +131,7 @@ async function main(): Promise<void> {
   if (useCli) {
     brain = new CliBrain({
       model: cfg.model_tier1,
-      servers,
+      servers: cliServers,
       allowedTools: CLI_ALLOWED,
       disallowedTools: CLI_DISALLOWED,
       onToolCall: () => {},

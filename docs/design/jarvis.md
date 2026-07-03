@@ -281,15 +281,34 @@ drives turns + the performance layer, not history). Two ship, **CLI is the defau
   the CLI cold-start tax is paid once (~5s on the first turn) instead of every turn — which is
   exactly why per-turn `claude -p` spawning, and squad-as-brain, were rejected for voice.
   Measured warm first-item ≈1.8s; context carries across turns (the process holds the
-  conversation). Claude Code owns the agent loop and calls our MCP servers directly;
-  `content_block_delta` text feeds the performance compiler unchanged, so the inline stage markup
-  works identically. Env that would divert it to an API key / Bedrock / Vertex is stripped so it
-  always uses the OAuth subscription. Safety across the split: Claude may call reads +
+  conversation). Claude Code owns the agent loop and calls our MCP servers directly. Env that
+  would divert it to an API key / Bedrock / Vertex is stripped so it always uses the OAuth
+  subscription. Safety across the split: Claude may call `say`, `Bash`, web tools, reads +
   `wiki_propose_edit`, but `wiki_commit` and browser `mutate` tools are withheld
   (`--disallowedTools`) — when Claude proposes, jarvisd shows the diff, runs the confirm broker,
   and commits via *its own* MCP client, so "nothing lands without your yes" holds even though
   Claude owns the loop. Deferred on this path (API-only for now): tier-2 dispatch and
   model-written `remember_fact`; facts are still *read* into every CLI turn.
+
+  **Speech-as-tool (the CLI path's speech contract, 2026-07-03).** Originally every
+  `content_block_delta` text token was surfaced as speech. Replaced at Rafe's direction: the
+  model is *silent by default* and speaks by calling a `say` tool (a stub `speech` MCP server
+  that just acks). jarvisd watches the child's event stream and feeds `say`'s **input JSON
+  deltas** through an incremental extractor (`SayTextExtractor`) into the performance compiler,
+  so TTS starts on the first sentence of a say — before the tool call even completes — and the
+  instant ack means the agent keeps working *while* the audio plays. Plain text the model emits
+  outside `say` is private workspace, never spoken (mute-safety net: a turn that ends with zero
+  says but non-empty text gets that text spoken as a fallback). This is what lets Jarvis
+  interject mid-work — say, run a command, say again — instead of performing only at turn edges.
+  Stage markup rides inside say text, so the compiler is unchanged. The ApiBrain keeps the
+  legacy all-streamed-text-is-speech contract (`buildSystemPrompt("stream")` vs `"say-tool"`).
+
+  **Shell access (2026-07-03, Rafe's call).** The CLI brain's shell is Claude Code's own `Bash`
+  tool — no MCP needed. It runs *unconfirmed* (bypassPermissions); "ask aloud before anything
+  destructive, never touch ~/wiki through the shell" are prompt norms, not gates. File-editing
+  built-ins (`Edit`/`Write`/`NotebookEdit`) stay disallowed so the wiki propose→confirm→commit
+  gate can't be bypassed. The API path gets parity via a `terminal_run` MCP tool (fresh `zsh -lc`
+  subshell, 30s timeout, output cap) classified `navigate` — narrate-then-act, no confirm.
 - **`ApiBrain` — Anthropic SDK fallback** (used only when the CLI is absent or `JARVIS_BRAIN=api`).
   jarvisd owns the loop, tool execution, tier-2, and built-ins, as described below.
 

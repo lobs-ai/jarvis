@@ -1,7 +1,7 @@
 // Greenfield mic capture (no browser ancestor exists — design §Voice ports):
 // getUserMedia → lowpass biquad (anti-alias) → AudioWorklet tap → linear
-// resample to 16 kHz → PCM16 frames upstream. PTT is the v0 gesture; the
-// worklet stays wired while the gate decides whether frames are forwarded.
+// resample to 16 kHz → PCM16 frames upstream. The mic switch turns capture on
+// and off; the endpointer downstream decides what becomes an utterance.
 
 const WORKLET_JS = `
 class MicTap extends AudioWorkletProcessor {
@@ -33,6 +33,9 @@ export class Mic {
       },
     });
     this.ctx = new AudioContext();
+    // autoplay policy can hand out a suspended context even after a gesture;
+    // a suspended context runs the worklet never — i.e. silent blank capture
+    if (this.ctx.state === "suspended") await this.ctx.resume();
     const url = URL.createObjectURL(new Blob([WORKLET_JS], { type: "text/javascript" }));
     await this.ctx.audioWorklet.addModule(url);
 
@@ -57,6 +60,8 @@ export class Mic {
   begin(): void {
     this.resampleCarry = 0;
     this.capturing = true;
+    // belt-and-suspenders: never capture from a suspended context
+    if (this.ctx?.state === "suspended") void this.ctx.resume();
   }
 
   end(): void {
@@ -77,7 +82,9 @@ export class Mic {
       out[i] = Math.max(-32768, Math.min(32767, Math.round(sample * 32767)));
       pos += ratio;
     }
-    this.resampleCarry = pos - input.length;
+    // fractional read offset into the NEXT frame; clamp — a negative carry
+    // would index before the buffer and inject zero samples at frame seams
+    this.resampleCarry = Math.max(0, pos - input.length);
     return new Uint8Array(out.buffer);
   }
 }

@@ -1,8 +1,13 @@
-// jarvis terminal eyes — read-only scrollback of the active terminal session,
-// so "why is this failing?" resolves at a shell. Strategy order: tmux active
-// pane → iTerm2 AppleScript → Terminal.app AppleScript. Read-only by design.
+// jarvis terminal — eyes AND hands at the shell.
+//   terminal_context: read-only scrollback of Rafe's active terminal session,
+//     so "why is this failing?" resolves at a shell. Strategy order: tmux
+//     active pane → iTerm2 AppleScript → Terminal.app AppleScript.
+//   terminal_run: run a command (zsh) in a fresh subshell — the API-path
+//     equivalent of the CLI brain's built-in Bash tool. It does NOT type into
+//     Rafe's visible terminal; his sessions stay his.
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
@@ -64,6 +69,45 @@ server.tool(
     }
     return { content: [{ type: "text", text: "no readable terminal session found" }] };
   },
+);
+
+const RUN_TIMEOUT_MS = 30_000;
+const OUTPUT_CAP = 8_000; // chars — long output belongs on the stage, summarized
+
+server.tool(
+  "terminal_run",
+  "Run a shell command on Rafe's Mac (zsh, fresh subshell, 30s timeout). Returns exit code " +
+    "plus combined stdout/stderr, capped. Use freely for readable/reversible work; ask Rafe " +
+    "aloud before anything destructive or hard to reverse.",
+  {
+    command: z.string().describe("the command line to run"),
+    cwd: z.string().optional().describe("working directory (default: Rafe's home)"),
+  },
+  async ({ command, cwd }) =>
+    new Promise((resolve) => {
+      execFile(
+        "/bin/zsh",
+        ["-lc", command],
+        {
+          cwd: cwd || process.env.HOME,
+          timeout: RUN_TIMEOUT_MS,
+          maxBuffer: 4 * 1024 * 1024,
+          encoding: "utf8",
+        },
+        (err, stdout, stderr) => {
+          const killed = err && "killed" in err && (err as { killed?: boolean }).killed;
+          const code = err ? ((err as { code?: number | string }).code ?? 1) : 0;
+          let out = [stdout, stderr].filter(Boolean).join("\n--- stderr ---\n").trimEnd();
+          if (out.length > OUTPUT_CAP) out = out.slice(0, OUTPUT_CAP) + "\n[output truncated]";
+          // A failing command is data, not a tool error — the model reads the
+          // exit header and diagnoses; isError would mask output as "tool error".
+          const head = killed
+            ? `[timed out after ${RUN_TIMEOUT_MS / 1000}s]`
+            : `[exit ${typeof code === "number" ? code : `signal ${code}`}]`;
+          resolve({ content: [{ type: "text", text: `${head}\n${out || "(no output)"}` }] });
+        },
+      );
+    }),
 );
 
 const transport = new StdioServerTransport();

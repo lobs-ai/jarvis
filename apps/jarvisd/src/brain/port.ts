@@ -1,8 +1,11 @@
 import type { ToolDef, ToolExecutor } from "./loop.js";
 
 export interface BrainCallbacks {
-  onTextDelta: (delta: string) => void;
+  onTextDelta: (delta: string) => void; // SPOKEN text (say-tool input, or all text on the stream path)
   onToolCall?: (name: string) => void;
+  // private-workspace text (never spoken) — surfaced as the stage's dim
+  // inner-monologue line so silent work is visibly alive
+  onThought?: (delta: string) => void;
 }
 
 // The brain is swappable (design §Brain wiring): CliBrain rides Rafe's Claude

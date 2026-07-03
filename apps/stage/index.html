@@ -13,7 +13,7 @@
         <div id="transcript"></div>
       </aside>
       <footer id="console">
-        <div id="orb" title="tap to wake">
+        <div id="orb" title="click to interrupt">
           <div class="core"></div>
           <div class="ring"></div>
         </div>
@@ -21,6 +21,8 @@
           <input id="input" type="text" placeholder="talk or type…" />
         </form>
         <div id="modes">
+          <button id="micToggle" type="button" title="mic is off — click or Space to listen">🎙</button>
+          <div id="micLevel" class="muted" title="mic level"><div class="fill"></div></div>
           <button id="quietToggle" type="button" title="quiet mode: captions only">🔊</button>
           <span id="conn" class="dot" title="connection"></span>
         </div>

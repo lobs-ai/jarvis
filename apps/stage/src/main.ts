@@ -3,6 +3,7 @@ import { Wire } from "./wire.js";
 import { Exhibits } from "./exhibits.js";
 import { Player } from "./audio/player.js";
 import { Mic } from "./audio/mic.js";
+import { Endpointer } from "./audio/endpointer.js";
 
 const $ = <T extends HTMLElement>(sel: string): T => {
   const el = document.querySelector<T>(sel);
@@ -21,12 +22,13 @@ const exhibits = new Exhibits($("#exhibits"));
 let quiet = false;
 let currentJarvisLine: HTMLElement | null = null;
 let currentTurnId: string | null = null;
+const thoughtLines = new Map<string, HTMLElement>();
 let serverOrb: OrbState = "idle";
-let pushingToTalk = false; // declared before setOrb, which reads it on first call
+let utteranceActive = false; // declared before setOrb, which reads it on first call
 
 function setOrb(state: OrbState): void {
   serverOrb = state;
-  orb.dataset.state = pushingToTalk ? "listening" : state;
+  orb.dataset.state = utteranceActive ? "listening" : state;
 }
 setOrb("idle");
 
@@ -43,68 +45,99 @@ function addLine(cls: string, text: string): HTMLElement {
 // ── audio ────────────────────────────────────────────────────
 const player = new Player(
   (turnId, seq) => wire.send({ type: "played", turnId, seq }),
-  () => {
-    /* half-duplex: PTT is manual, so playing state only affects barge-in below */
+  (playing) => {
+    // Half-duplex: our own TTS through the speakers must not become an
+    // utterance. While playing, mic frames are dropped (see Mic callback) and
+    // any half-built utterance is abandoned. Interrupt via Esc, typing, or orb.
+    if (playing && endpointer.cancel()) {
+      wire.send({ type: "mic.cancel" });
+      utteranceActive = false;
+      setOrb(serverOrb);
+    }
+    micUi();
   },
 );
 let micSeq = 0;
-const mic = new Mic((pcm) => wire.sendBinary(encodeBinaryFrame(1, micSeq++, pcm)));
 const audioMeta = new Map<number, { turnId: string }>();
 
-async function armAudio(): Promise<void> {
-  player.arm();
-  if (!mic.isArmed) {
+// ── mic switch (on/off toggle, energy endpointing — no hold) ─
+const micToggle = $<HTMLButtonElement>("#micToggle");
+const micLevel = $("#micLevel");
+const micLevelFill = $("#micLevel .fill");
+let micOn = false;
+let level = 0;
+
+const MIN_UTTER_MS = 350; // shorter → likely a cough/click; cancel, don't transcribe
+
+const endpointer = new Endpointer({
+  onUtteranceStart: () => {
+    utteranceActive = true;
+    setOrb(serverOrb);
+    wire.send({ type: "mic.begin", sampleRate: 16000 });
+  },
+  onAudio: (pcm) => wire.sendBinary(encodeBinaryFrame(1, micSeq++, pcm)),
+  onUtteranceEnd: (durMs) => {
+    utteranceActive = false;
+    setOrb(serverOrb);
+    wire.send(durMs < MIN_UTTER_MS ? { type: "mic.cancel" } : { type: "mic.end" });
+  },
+  onLevel: (rms) => {
+    level = Math.max(rms, level * 0.82); // fast attack, slow decay
+    micLevelFill.style.width = `${Math.min(100, (level / 0.12) * 100)}%`;
+  },
+});
+
+const mic = new Mic((pcm) => {
+  if (!micOn) return;
+  if (player.isPlaying) return; // half-duplex: drop frames while Jarvis talks
+  endpointer.push(pcm);
+});
+
+function micUi(): void {
+  micToggle.classList.toggle("on", micOn);
+  micToggle.title = micOn ? "mic is on — click or Space to mute" : "mic is off — click or Space to listen";
+  micLevel.classList.toggle("muted", !micOn || player.isPlaying);
+  if (!micOn) micLevelFill.style.width = "0%";
+}
+
+async function toggleMic(): Promise<void> {
+  if (!micOn) {
+    player.arm();
     try {
       await mic.arm();
     } catch (err) {
       addLine("warn", `mic unavailable: ${String(err)}`);
+      return;
     }
+    micOn = true;
+    mic.begin();
+  } else {
+    micOn = false;
+    mic.end();
+    if (endpointer.cancel()) wire.send({ type: "mic.cancel" });
+    utteranceActive = false;
+    setOrb(serverOrb);
   }
+  micUi();
 }
 
-// ── push-to-talk (v0 gesture; open-mic VAD is a later phase) ─
-async function pttDown(): Promise<void> {
-  if (pushingToTalk) return;
-  pushingToTalk = true;
-  await armAudio();
-  // talking over Jarvis IS barge-in: stop playback, tell the daemon
-  if (player.isPlaying || serverOrb === "speaking" || serverOrb === "thinking") {
-    player.flush();
-    wire.send({ type: "interrupt" });
-  }
-  orb.dataset.state = "listening";
-  wire.send({ type: "mic.begin", sampleRate: 16000 });
-  mic.begin();
-}
+micToggle.addEventListener("click", () => void toggleMic());
 
-function pttUp(): void {
-  if (!pushingToTalk) return;
-  pushingToTalk = false;
-  mic.end();
-  wire.send({ type: "mic.end" });
-  orb.dataset.state = serverOrb;
+function interruptPerformance(): void {
+  player.flush();
+  wire.send({ type: "interrupt" });
 }
 
 document.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape") {
-    player.flush();
-    wire.send({ type: "interrupt" });
+    interruptPerformance();
     return;
   }
   if (ev.code === "Space" && document.activeElement !== input && !ev.repeat) {
     ev.preventDefault();
-    void pttDown();
+    void toggleMic();
   }
 });
-document.addEventListener("keyup", (ev) => {
-  if (ev.code === "Space" && pushingToTalk) {
-    ev.preventDefault();
-    pttUp();
-  }
-});
-orb.addEventListener("mousedown", () => void pttDown());
-orb.addEventListener("mouseup", () => pttUp());
-orb.addEventListener("mouseleave", () => pttUp());
 
 // ── wire ─────────────────────────────────────────────────────
 const wire = new Wire({
@@ -131,10 +164,24 @@ const wire = new Wire({
         if (currentTurnId === msg.turnId) currentTurnId = null;
         currentJarvisLine?.classList.remove("speaking");
         currentJarvisLine = null;
+        thoughtLines.delete(msg.turnId); // line stays in the rail as history
         return;
       case "heard":
         addLine("user", msg.text);
         return;
+      case "thought": {
+        // inner monologue: one dim line per turn, updated in place — proof of
+        // life while Jarvis works or deliberately stays quiet
+        let line = thoughtLines.get(msg.turnId);
+        if (!line) {
+          line = addLine("thought", msg.text);
+          thoughtLines.set(msg.turnId, line);
+        } else {
+          line.textContent = msg.text;
+          transcript.scrollTop = transcript.scrollHeight;
+        }
+        return;
+      }
       case "item": {
         const item = msg.item;
         if (item.kind === "say") {
@@ -202,9 +249,13 @@ quietToggle.addEventListener("click", () => {
   wire.send({ type: "quiet.set", quiet });
 });
 
-// tap-to-wake: arms audio (the required user gesture) and focuses input
+// orb: interrupt an active performance, otherwise focus the input
 orb.addEventListener("click", () => {
-  void armAudio();
+  if (player.isPlaying || serverOrb === "speaking" || serverOrb === "thinking") {
+    interruptPerformance();
+    return;
+  }
   input.focus();
 });
 input.focus();
+micUi();

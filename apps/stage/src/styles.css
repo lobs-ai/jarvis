@@ -129,6 +129,10 @@ body {
 .line.jarvis { color: var(--ink); }
 .line.jarvis.speaking { color: #fff; text-shadow: 0 0 12px rgba(55, 211, 194, 0.35); }
 .line.warn { color: var(--warn); font-size: 12px; }
+.line.thought {
+  color: var(--ink-dim); opacity: 0.55; font-style: italic; font-size: 11.5px;
+  white-space: pre-wrap; border-left: 2px solid rgba(90, 167, 255, 0.2); padding-left: 8px;
+}
 @keyframes fadein { from { opacity: 0; transform: translateY(4px); } }
 
 /* ── console: orb + input ───────────────── */
@@ -188,6 +192,25 @@ body {
   background: none; border: none; cursor: pointer; font-size: 18px;
   opacity: 0.8;
 }
+#micToggle {
+  background: none; border: none; cursor: pointer; font-size: 18px;
+  opacity: 0.35; filter: grayscale(1);
+  transition: opacity 150ms, filter 150ms;
+}
+#micToggle.on {
+  opacity: 1; filter: none;
+  text-shadow: 0 0 12px rgba(90, 167, 255, 0.9);
+}
+#micLevel {
+  width: 46px; height: 4px; border-radius: 2px;
+  background: rgba(255, 255, 255, 0.08); overflow: hidden; flex: none;
+}
+#micLevel .fill {
+  height: 100%; width: 0%;
+  background: linear-gradient(90deg, var(--sky), #b8d9ff);
+  transition: width 60ms linear;
+}
+#micLevel.muted .fill { background: rgba(255, 255, 255, 0.22); }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--err); display: inline-block; }
 .dot.on { background: var(--teal); box-shadow: 0 0 8px rgba(55, 211, 194, 0.8); }
 

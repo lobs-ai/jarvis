@@ -16,6 +16,10 @@ const RISK_REGISTRY: Array<[RegExp, RiskClass]> = [
   [/^wiki_commit$/, "mutate"],
   [/^browser_(click|type|submit)/, "mutate"],
   [/^browser_(navigate|open)/, "navigate"],
+  // Rafe's call: the shell runs unconfirmed (parity with the CLI path's Bash).
+  // "navigate" still drains speech first, so the pre-command line plays before
+  // the command fires; destructive-action asking is a prompt norm, not a gate.
+  [/^terminal_run$/, "navigate"],
 ];
 
 export function riskOf(tool: string): RiskClass {

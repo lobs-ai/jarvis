@@ -37,6 +37,9 @@ export const ServerMessage = z.discriminatedUnion("type", [
   // live transcript of what STT heard (caption rail shows user side too)
   z.object({ type: z.literal("heard"), turnId: z.string(), text: z.string() }),
   z.object({ type: z.literal("item"), item: PerformanceItem }),
+  // the model's private workspace (scratch text + tool markers), surfaced as a
+  // dim inner-monologue line so silent work is visibly alive — never spoken
+  z.object({ type: z.literal("thought"), turnId: z.string(), text: z.string() }),
   // audio for a say item arrives as a binary frame; this announces it
   z.object({
     type: z.literal("audio.segment"),

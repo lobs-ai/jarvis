@@ -8,7 +8,7 @@ export const JARVIS_HOME = join(homedir(), ".jarvis");
 
 const ConfigSchema = z.object({
   port: z.number().int().default(7430),
-  model_tier1: z.string().default("claude-sonnet-5"),
+  model_tier1: z.string().default("claude-opus-4-8"), // Rafe's call: opus over sonnet's latency edge
   model_tier2: z.string().default("claude-fable-5"),
   stt_url: z.string().default("http://127.0.0.1:7423"),
   tts_url: z.string().default("http://127.0.0.1:7422"),

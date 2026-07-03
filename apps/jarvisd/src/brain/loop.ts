@@ -1,5 +1,8 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { SYSTEM_PROMPT } from "./prompt.js";
+import { buildSystemPrompt } from "./prompt.js";
+
+// The SDK path keeps the legacy speech contract: all streamed text IS speech.
+const STREAM_PROMPT = buildSystemPrompt("stream");
 
 export interface ToolDef {
   name: string;
@@ -57,7 +60,7 @@ export async function runTurn(opts: {
   }
 
   const system: Anthropic.TextBlockParam[] = [
-    { type: "text", text: opts.systemOverride ?? SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
+    { type: "text", text: opts.systemOverride ?? STREAM_PROMPT, cache_control: { type: "ephemeral" } },
   ];
   // facts change rarely; a separate uncached block preserves the prompt cache
   if (opts.facts) {
