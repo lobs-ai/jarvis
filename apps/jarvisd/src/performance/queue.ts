@@ -73,6 +73,19 @@ export class PerformanceQueue {
     return this.donePromise;
   }
 
+  // Resolves when everything enqueued so far has been performed. Used to defer
+  // navigate/mutate act-tool execution until the performance catches up —
+  // the model's pre-tool narration plays BEFORE the action fires (design §acts).
+  async waitForDrain(): Promise<void> {
+    while (!this.interrupted && this.playhead < this.items.length) {
+      await new Promise((r) => setTimeout(r, 60));
+    }
+  }
+
+  get wasInterrupted(): boolean {
+    return this.interrupted;
+  }
+
   private prefetchTts(): void {
     const { tts, lookahead = 2 } = this.opts;
     if (!tts) return;

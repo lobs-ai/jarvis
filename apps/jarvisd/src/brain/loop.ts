@@ -35,10 +35,34 @@ export async function runTurn(opts: {
   callbacks: TurnCallbacks;
   signal: AbortSignal;
   maxTokens?: number;
+  facts?: string | null;
+  systemOverride?: string;
 }): Promise<TurnResult> {
   const { client, model, tools, execute, callbacks, signal } = opts;
   const messages: Anthropic.MessageParam[] = [...opts.history];
   let fullText = "";
+
+  // Debug harness (design: text is the debug path forever): JARVIS_MOCK_BRAIN
+  // replays a canned performance token-by-token, so the whole pipeline is
+  // provable with no API key. Never engaged when a real key is present in prod.
+  if (process.env.JARVIS_MOCK_BRAIN) {
+    const canned = mockPerformance(lastUserText(messages));
+    for (const ch of canned) {
+      if (signal.aborted) return { fullText, aborted: true };
+      fullText += ch;
+      callbacks.onTextDelta(ch);
+      await new Promise((r) => setTimeout(r, 4));
+    }
+    return { fullText, aborted: false };
+  }
+
+  const system: Anthropic.TextBlockParam[] = [
+    { type: "text", text: opts.systemOverride ?? SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
+  ];
+  // facts change rarely; a separate uncached block preserves the prompt cache
+  if (opts.facts) {
+    system.push({ type: "text", text: `## What you know about working with Rafe\n\n${opts.facts}` });
+  }
 
   for (let hop = 0; hop < 8; hop++) {
     if (signal.aborted) return { fullText, aborted: true };
@@ -47,13 +71,7 @@ export async function runTurn(opts: {
       {
         model,
         max_tokens: opts.maxTokens ?? 4096,
-        system: [
-          {
-            type: "text",
-            text: SYSTEM_PROMPT,
-            cache_control: { type: "ephemeral" },
-          },
-        ],
+        system,
         messages,
         ...(tools.length > 0 ? { tools: tools as Anthropic.Tool[] } : {}),
       },
@@ -96,4 +114,24 @@ export async function runTurn(opts: {
   }
 
   return { fullText, aborted: false };
+}
+
+function lastUserText(messages: Anthropic.MessageParam[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.role === "user" && typeof m.content === "string") return m.content;
+  }
+  return "";
+}
+
+function mockPerformance(userText: string): string {
+  return (
+    `You asked about "${userText.slice(0, 40)}". Here's the shape of it. ` +
+    `<show id="e1" type="markdown" title="mock exhibit">## It works\n\n` +
+    `This exhibit was **conjured mid-sentence** by the mock brain — proving the ` +
+    `compiler, queue, and stage render in sync without any API key.\n\n` +
+    `- say items stream as captions\n- show items materialize in stream order</show> ` +
+    `The card appeared right as I mentioned it, then I keep talking afterward. ` +
+    `<dismiss ref="e1"/> And now it's swept away. That's the performance engine end to end.`
+  );
 }

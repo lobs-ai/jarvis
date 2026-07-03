@@ -42,6 +42,11 @@ export class MemoryStore {
     return readFileSync(FACTS_PATH, "utf8");
   }
 
+  appendFact(fact: string): void {
+    const line = `- ${fact.replace(/\n+/g, " ").trim()}\n`;
+    appendFileSync(FACTS_PATH, line, { mode: 0o600 });
+  }
+
   // TTS pronunciation substitutions from facts.md lines like:  say: MemCore => mem core
   pronunciationMap(): Array<[string, string]> {
     const facts = this.readFacts();

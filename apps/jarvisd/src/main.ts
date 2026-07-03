@@ -10,6 +10,8 @@ import { Session } from "./session.js";
 import { StageSocket } from "./ws.js";
 import { McpManager, riskOf, type McpServerSpec } from "./mcp/manager.js";
 import { ConfirmBroker } from "./mcp/confirm.js";
+import { BackgroundRunner } from "./brain/tasks.js";
+import type { ToolDef } from "./brain/loop.js";
 
 const STAGE_DIST = fileURLToPath(new URL("../../stage/dist", import.meta.url));
 const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
@@ -66,10 +68,70 @@ async function main(): Promise<void> {
   const mcp = new McpManager();
   session.attachMcp(mcp, confirm);
 
+  const servers: McpServerSpec[] = [
+    {
+      name: "wiki",
+      command: TSX,
+      args: [join(REPO_ROOT, "servers/wiki/src/index.ts")],
+      env: { JARVIS_WIKI_DIR: cfg.wiki_dir },
+    },
+    { name: "terminal", command: TSX, args: [join(REPO_ROOT, "servers/terminal/src/index.ts")] },
+    { name: "browser", command: TSX, args: [join(REPO_ROOT, "servers/browser/src/index.ts")] },
+  ];
+
+  // Tier-2 background runner: own MCP connections, reduced toolset, results
+  // announced only when the channel is idle.
+  const bg = new BackgroundRunner(client, cfg.model_tier2, servers, (report) => {
+    const summary =
+      report.report.length > 400 ? report.report.slice(0, 400) + "…" : report.report;
+    const proposalNote = report.proposals.length
+      ? ` I staged ${report.proposals.length} wiki edit(s) for you to review.`
+      : "";
+    session.announceWhenIdle(`Finished "${report.task.slice(0, 60)}".${proposalNote}`, summary);
+  });
+  session.setBackgroundDispatch((task) => bg.dispatch(task));
+
+  // dispatch_background is a built-in tool (not MCP): the loop stays boring, but
+  // the model can hand off long work (design §two-tier brain).
+  const BUILTIN_TOOLS: ToolDef[] = [
+    {
+      name: "dispatch_background",
+      description:
+        "Hand a long-running task to your background worker (stronger, slower model). Returns immediately; you'll be able to report the result when it finishes. Use for multi-step work like reorganizing wiki pages — NOT for quick answers.",
+      input_schema: {
+        type: "object",
+        properties: { task: { type: "string", description: "self-contained task description" } },
+        required: ["task"],
+      },
+    },
+    {
+      name: "remember_fact",
+      description:
+        "Append one line to YOUR OWN operational memory about working with Rafe (preferences, standing instructions, pronunciation fixes like `say: MemCore => mem core`). This is NOT the wiki — never store facts about Rafe's life here.",
+      input_schema: {
+        type: "object",
+        properties: { fact: { type: "string" } },
+        required: ["fact"],
+      },
+    },
+  ];
+
   const refreshTools = (): void => {
-    session.setTools(mcp.tools(), async (name, input) => {
-      // mutate-class actions require positive confirmation (design §Security)
-      if (riskOf(name) === "mutate") {
+    session.setTools([...BUILTIN_TOOLS, ...mcp.tools()], async (name, input) => {
+      if (name === "dispatch_background") {
+        const id = bg.dispatch(String(input.task ?? ""));
+        return `dispatched as ${id}; tell Rafe you'll report back when it's done.`;
+      }
+      if (name === "remember_fact") {
+        session.appendFact(String(input.fact ?? ""));
+        return "remembered.";
+      }
+      const risk = riskOf(name);
+      if (risk !== "read") {
+        // narrate-then-act: let the spoken announcement play before acting
+        await session.waitForActiveDrain();
+      }
+      if (risk === "mutate") {
         const summary = `${name}(${JSON.stringify(input).slice(0, 120)})`;
         const ok = await confirm.request(summary, JSON.stringify(input, null, 2));
         if (!ok) return "DENIED: Rafe did not confirm this action. Do not retry it unless he asks.";
@@ -78,16 +140,8 @@ async function main(): Promise<void> {
     });
   };
   mcp.onToolsChanged = refreshTools;
-
-  const servers: McpServerSpec[] = [
-    {
-      name: "wiki",
-      command: TSX,
-      args: [join(REPO_ROOT, "servers/wiki/src/index.ts")],
-      env: { JARVIS_WIKI_DIR: cfg.wiki_dir },
-    },
-  ];
   void mcp.connectAll(servers).then(refreshTools);
+  refreshTools();
 
   const server = createServer((req, res) => {
     const url = (req.url ?? "/").split("?")[0]!;

@@ -14,6 +14,7 @@ export class StageSocket implements SessionSink {
   private ws: WebSocket | null = null;
   private session: Session | null = null;
   private audioStreamCounter = 0;
+  private lastOrb: string | null = null;
 
   attach(server: HttpServer): void {
     const wss = new WebSocketServer({ server, path: "/ws" });
@@ -111,6 +112,8 @@ export class StageSocket implements SessionSink {
   }
 
   sendState(orb: Parameters<SessionSink["sendState"]>[0]): void {
+    if (orb === this.lastOrb) return; // dedupe: state is re-asserted on every token
+    this.lastOrb = orb;
     this.send({ type: "state", orb });
   }
 

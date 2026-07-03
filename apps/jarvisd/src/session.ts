@@ -57,6 +57,47 @@ export class Session {
     this.confirm = confirm;
   }
 
+  // M4: tier-2 dispatch + idle-channel announcements (pattern ported from
+  // lobs-core realtime-session: results speak only when the channel is idle).
+  private dispatchBackground: ((task: string) => string) | null = null;
+  private pendingAnnouncements: Array<{ text: string; report: string }> = [];
+  setBackgroundDispatch(fn: (task: string) => string): void {
+    this.dispatchBackground = fn;
+  }
+
+  announceWhenIdle(text: string, report: string): void {
+    this.pendingAnnouncements.push({ text, report });
+    this.drainAnnouncements();
+  }
+
+  private drainAnnouncements(): void {
+    if (this.active || this.pendingAnnouncements.length === 0) return;
+    const { text, report } = this.pendingAnnouncements.shift()!;
+    const turnId = this.nextTurnId();
+    // announcements enter history so the model knows what it told Rafe
+    this.history.push({ role: "assistant", content: text });
+    const queue = new PerformanceQueue({
+      turnId,
+      tts: this.quiet ? null : this.tts,
+      sink: {
+        sendItem: (item) => this.sink.sendItem(item),
+        sendAudio: (t, seq, pcm) => this.sink.sendAudio(t, seq, pcm),
+        sendWarning: (m) => this.sink.sendWarning(m),
+      },
+      ttsTextTransform: this.makePronunciationTransform(),
+    });
+    queue.enqueue({ kind: "say", seq: 0, turnId, text });
+    queue.enqueue({
+      kind: "show",
+      seq: 1,
+      turnId,
+      id: "bg-report",
+      exhibit: { type: "markdown", title: "background task", body: report },
+    });
+    queue.endOfItems();
+    void queue.whenDone().then(() => this.drainAnnouncements());
+  }
+
   setVoicePorts(stt: SttLike | null, tts: TtsLike | null): void {
     this.stt = stt;
     this.tts = tts;
@@ -138,6 +179,16 @@ export class Session {
   interrupt(): void {
     if (!this.active) return;
     this.truncateInterrupted();
+  }
+
+  // Narrate-then-act: navigate/mutate tools wait until the performance catches
+  // up, so the model's pre-tool line plays BEFORE the action fires (design §acts).
+  async waitForActiveDrain(): Promise<void> {
+    await this.active?.queue.waitForDrain();
+  }
+
+  appendFact(fact: string): void {
+    this.store.appendFact(fact);
   }
 
   private nextTurnId(): string {
@@ -243,6 +294,7 @@ export class Session {
         history: apiHistory,
         tools: this.tools,
         execute: this.executor,
+        facts: this.store.readFacts(),
         callbacks: {
           onTextDelta: (delta) => {
             if (perceivedStart !== undefined && !this.firstTokenLogged.has(turnId)) {
@@ -266,6 +318,7 @@ export class Session {
         this.active = null;
         this.sink.sendTurnEnd(turnId);
         this.sink.sendState("idle");
+        this.drainAnnouncements(); // channel just went idle
       }
     } catch (err) {
       if (this.active?.turnId === turnId) {

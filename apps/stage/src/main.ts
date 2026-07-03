@@ -22,6 +22,7 @@ let quiet = false;
 let currentJarvisLine: HTMLElement | null = null;
 let currentTurnId: string | null = null;
 let serverOrb: OrbState = "idle";
+let pushingToTalk = false; // declared before setOrb, which reads it on first call
 
 function setOrb(state: OrbState): void {
   serverOrb = state;
@@ -62,8 +63,6 @@ async function armAudio(): Promise<void> {
 }
 
 // ── push-to-talk (v0 gesture; open-mic VAD is a later phase) ─
-let pushingToTalk = false;
-
 async function pttDown(): Promise<void> {
   if (pushingToTalk) return;
   pushingToTalk = true;
