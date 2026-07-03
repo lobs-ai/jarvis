@@ -8,8 +8,12 @@ import { loadConfig, requireApiKey } from "./config.js";
 import { MemoryStore } from "./memory/store.js";
 import { Session } from "./session.js";
 import { StageSocket } from "./ws.js";
+import { McpManager, riskOf, type McpServerSpec } from "./mcp/manager.js";
+import { ConfirmBroker } from "./mcp/confirm.js";
 
 const STAGE_DIST = fileURLToPath(new URL("../../stage/dist", import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
+const TSX = fileURLToPath(new URL("../node_modules/.bin/tsx", import.meta.url));
 
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -38,7 +42,7 @@ async function main(): Promise<void> {
   session.setVoicePorts(sttOk ? stt : null, ttsOk ? tts : null);
   console.log(`voice ports: stt=${sttOk ? "ok" : "DOWN"} tts=${ttsOk ? "ok" : "DOWN"}`);
   if (!ttsOk) {
-    // Chatterbox takes ~30-60s to load the model; re-probe until it comes up.
+    // TTS model load takes a while on cold start; re-probe until it comes up.
     const probe = setInterval(() => {
       void tts.healthy().then((ok) => {
         if (ok) {
@@ -50,11 +54,74 @@ async function main(): Promise<void> {
     }, 5000);
   }
 
+  // MCP: integrations are servers; the stage markup needs none of this (M0),
+  // but tools, bundle context, and confirmations all flow through here.
+  const confirm = new ConfirmBroker(
+    (confirmId, summary, detail, phrases) =>
+      sock.sendConfirmRequest(confirmId, summary, detail, phrases),
+    (confirmId, approved) => sock.sendConfirmResolved(confirmId, approved),
+  );
+  sock.onConfirm = (confirmId, approve) => confirm.resolve(confirmId, approve);
+
+  const mcp = new McpManager();
+  session.attachMcp(mcp, confirm);
+
+  const refreshTools = (): void => {
+    session.setTools(mcp.tools(), async (name, input) => {
+      // mutate-class actions require positive confirmation (design §Security)
+      if (riskOf(name) === "mutate") {
+        const summary = `${name}(${JSON.stringify(input).slice(0, 120)})`;
+        const ok = await confirm.request(summary, JSON.stringify(input, null, 2));
+        if (!ok) return "DENIED: Rafe did not confirm this action. Do not retry it unless he asks.";
+      }
+      return mcp.execute(name, input);
+    });
+  };
+  mcp.onToolsChanged = refreshTools;
+
+  const servers: McpServerSpec[] = [
+    {
+      name: "wiki",
+      command: TSX,
+      args: [join(REPO_ROOT, "servers/wiki/src/index.ts")],
+      env: { JARVIS_WIKI_DIR: cfg.wiki_dir },
+    },
+  ];
+  void mcp.connectAll(servers).then(refreshTools);
+
   const server = createServer((req, res) => {
     const url = (req.url ?? "/").split("?")[0]!;
     if (url === "/healthz") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    // Exhibit ref resolver: <show ref="wiki:PATH"/> → the stage fetches here.
+    if (url === "/ref") {
+      const uri = new URL(req.url ?? "", "http://x").searchParams.get("uri") ?? "";
+      const m = uri.match(/^wiki:(.+)$/);
+      if (!m) {
+        res.writeHead(404);
+        res.end(`unresolvable ref scheme: ${uri}`);
+        return;
+      }
+      void mcp
+        .execute("wiki_read", { path: m[1]! })
+        .then((text) => {
+          if (text.startsWith("tool error") || text.startsWith("tool unavailable") || text.startsWith("no such page")) {
+            res.writeHead(404);
+            res.end(text.slice(0, 500));
+            return;
+          }
+          // strip the "# path (base-hash …)" header wiki_read prepends
+          const body = text.replace(/^# \S+ \(base-hash \w+\)\n\n/, "");
+          res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+          res.end(body);
+        })
+        .catch((err) => {
+          res.writeHead(500);
+          res.end(String(err));
+        });
       return;
     }
     // Static stage. COOP/COEP: the Silero VAD worker needs cross-origin isolation.

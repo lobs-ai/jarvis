@@ -190,3 +190,17 @@ body {
 }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--err); display: inline-block; }
 .dot.on { background: var(--teal); box-shadow: 0 0 8px rgba(55, 211, 194, 0.8); }
+
+.confirm-card { border-color: rgba(255, 179, 90, 0.4); }
+.confirm-card header { color: var(--warn); }
+.confirm-card button {
+  background: var(--surface-2);
+  color: var(--ink);
+  border: 1px solid rgba(90, 167, 255, 0.25);
+  border-radius: 8px;
+  padding: 7px 16px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.confirm-card button.approve { border-color: rgba(55, 211, 194, 0.5); color: var(--teal); }
+.confirm-card button.deny { border-color: rgba(255, 107, 107, 0.4); color: var(--err); }

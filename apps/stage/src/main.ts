@@ -151,11 +151,33 @@ const wire = new Wire({
       case "audio.segment":
         audioMeta.set(msg.streamId, { turnId: msg.turnId });
         return;
-      case "confirm.request":
-        addLine("warn", `confirm requested: ${msg.summary}`);
+      case "confirm.request": {
+        // pending-confirmation card: click always works; spoken yes must
+        // exactly match one of msg.phrases (enforced daemon-side)
+        const card = document.createElement("div");
+        card.className = "exhibit confirm-card";
+        card.dataset.confirmId = msg.confirmId;
+        card.innerHTML =
+          `<header><span>confirm</span><span class="etype">mutate</span></header>` +
+          `<div class="body"><p>${msg.summary.replace(/[&<>]/g, (c) => `&#${c.charCodeAt(0)};`)}</p>` +
+          (msg.detail ? `<pre><code>${msg.detail.replace(/[&<>]/g, (c) => `&#${c.charCodeAt(0)};`)}</code></pre>` : "") +
+          `<p class="placeholder">say "${msg.phrases[0]}" or click:</p>` +
+          `<button class="approve">approve</button> <button class="deny">deny</button></div>`;
+        card.querySelector(".approve")!.addEventListener("click", () =>
+          wire.send({ type: "confirm", confirmId: msg.confirmId, approve: true }),
+        );
+        card.querySelector(".deny")!.addEventListener("click", () =>
+          wire.send({ type: "confirm", confirmId: msg.confirmId, approve: false }),
+        );
+        $("#exhibits").appendChild(card);
         return;
-      case "confirm.resolved":
+      }
+      case "confirm.resolved": {
+        document
+          .querySelectorAll<HTMLElement>(`[data-confirm-id="${msg.confirmId}"]`)
+          .forEach((el) => el.remove());
         return;
+      }
       case "error":
         addLine("warn", msg.message);
         return;

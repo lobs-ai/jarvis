@@ -66,20 +66,23 @@ export class Exhibits {
 
   private render(body: HTMLElement, exhibit: Exhibit): void {
     const content = "body" in exhibit ? exhibit.body : undefined;
+    // by-reference exhibits resolve through jarvisd's /ref endpoint
+    if (!content && exhibit.type !== "image" && exhibit.ref) {
+      body.innerHTML = `<div class="placeholder">conjuring ${escapeHtml(exhibit.ref)}…</div>`;
+      void fetch(`/ref?uri=${encodeURIComponent(exhibit.ref)}`)
+        .then(async (res) => {
+          if (!res.ok) throw new Error(await res.text());
+          const text = await res.text();
+          this.renderContent(body, exhibit.type, text);
+        })
+        .catch(() => this.placeholder(body, exhibit.ref));
+      return;
+    }
     switch (exhibit.type) {
-      case "markdown": {
-        if (content) body.innerHTML = marked.parse(content, { async: false }) as string;
-        else this.placeholder(body, exhibit.ref);
-        return;
-      }
-      case "code": {
-        if (content) {
-          body.innerHTML = `<pre><code>${escapeHtml(content)}</code></pre>`;
-        } else this.placeholder(body, exhibit.ref);
-        return;
-      }
+      case "markdown":
+      case "code":
       case "diff": {
-        if (content) body.innerHTML = renderDiff(content);
+        if (content) this.renderContent(body, exhibit.type, content);
         else this.placeholder(body, exhibit.ref);
         return;
       }
@@ -93,6 +96,12 @@ export class Exhibits {
         return;
       }
     }
+  }
+
+  private renderContent(body: HTMLElement, type: "markdown" | "code" | "diff", text: string): void {
+    if (type === "markdown") body.innerHTML = marked.parse(text, { async: false }) as string;
+    else if (type === "diff") body.innerHTML = renderDiff(text);
+    else body.innerHTML = `<pre><code>${escapeHtml(text)}</code></pre>`;
   }
 
   // A well-formed ref that can't resolve yet renders a placeholder naming the

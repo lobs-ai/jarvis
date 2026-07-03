@@ -125,4 +125,17 @@ export class StageSocket implements SessionSink {
   sendHeard(turnId: string, text: string): void {
     this.send({ type: "heard", turnId, text });
   }
+
+  sendConfirmRequest(
+    confirmId: string,
+    summary: string,
+    detail: string | undefined,
+    phrases: string[],
+  ): void {
+    this.send({ type: "confirm.request", confirmId, summary, detail, phrases });
+  }
+
+  sendConfirmResolved(confirmId: string, approved: boolean): void {
+    this.send({ type: "confirm.resolved", confirmId, approved });
+  }
 }
