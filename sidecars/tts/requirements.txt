@@ -1,0 +1,13 @@
+# Appendix A fix: chatterbox's `perth` watermarker imports pkg_resources, which
+# setuptools removed in v81+ (and uv venvs ship no setuptools at all). Without
+# this pin the model loads with PerthImplicitWatermarker = None and crashes.
+setuptools<81
+chatterbox-tts
+fastapi
+uvicorn[standard]
+torch
+torchaudio
+python-multipart
+
+kokoro-onnx
+soundfile

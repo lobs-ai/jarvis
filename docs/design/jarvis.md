@@ -359,6 +359,14 @@ dead air (mitigated under Performance engine, never zero). Movie-grade sub-secon
 achievable with this local stack; it requires hosted realtime adapters. That swap is per-port
 (hosted STT + local TTS is a legitimate mix), decided on M1 measurements, not taste.
 
+**M1 measurement outcome (2026-07-02, M3 Pro):** Chatterbox on MPS measured ~30s per sentence
+*warm* (~0.14× realtime) — unusable for conversation; the designated Kokoro fallback fires.
+The default TTS sidecar is now Kokoro-82M via ONNX (voice `bm_george`; measured 1.6s for 5.6s
+of audio, ~3.5× realtime — short openers well inside the 0.6–0.9s line), with Chatterbox kept
+as the optional cloning path on :7425 (`sidecars/tts/start-chatterbox.sh`) for when a cloned
+persona voice matters more than latency, or better hardware arrives. Whisper on the generated
+ANE encoder measured 145–615ms warm. The local stack holds; no hosted swap needed.
+
 One scoping truth, stated plainly so M1 is planned honestly: **the browser audio client is
 greenfield.** lobs-voice contains no TypeScript; the only ancestor pipeline
 (`lobs-core/src/services/voice/`) is Discord-side — Opus in, Discord player out. Its *logic*

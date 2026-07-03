@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, extname, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import Anthropic from "@anthropic-ai/sdk";
+import { WhisperStt, ChatterboxTts } from "@jarvis/voice";
 import { loadConfig, requireApiKey } from "./config.js";
 import { MemoryStore } from "./memory/store.js";
 import { Session } from "./session.js";
@@ -21,7 +22,7 @@ const MIME: Record<string, string> = {
   ".json": "application/json",
 };
 
-function main(): void {
+async function main(): Promise<void> {
   const cfg = loadConfig();
   const apiKey = requireApiKey();
   const client = new Anthropic({ apiKey });
@@ -29,6 +30,25 @@ function main(): void {
   const sock = new StageSocket();
   const session = new Session(cfg, client, sock, store, null, null);
   sock.bind(session);
+
+  // Voice ports: degrade gracefully if a sidecar is down (captions carry the turn).
+  const stt = new WhisperStt(cfg.stt_url);
+  const tts = new ChatterboxTts(cfg.tts_url, cfg.tts_voice);
+  const [sttOk, ttsOk] = await Promise.all([stt.healthy(), tts.healthy()]);
+  session.setVoicePorts(sttOk ? stt : null, ttsOk ? tts : null);
+  console.log(`voice ports: stt=${sttOk ? "ok" : "DOWN"} tts=${ttsOk ? "ok" : "DOWN"}`);
+  if (!ttsOk) {
+    // Chatterbox takes ~30-60s to load the model; re-probe until it comes up.
+    const probe = setInterval(() => {
+      void tts.healthy().then((ok) => {
+        if (ok) {
+          session.setVoicePorts(sttOk ? stt : null, tts);
+          console.log("voice ports: tts came up");
+          clearInterval(probe);
+        }
+      });
+    }, 5000);
+  }
 
   const server = createServer((req, res) => {
     const url = (req.url ?? "/").split("?")[0]!;
@@ -61,4 +81,4 @@ function main(): void {
   });
 }
 
-main();
+void main();

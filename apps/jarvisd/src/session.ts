@@ -88,9 +88,13 @@ export class Session {
       off += c.byteLength;
     }
     this.sink.sendState("thinking");
+    const t0 = Date.now(); // perceived clock starts at end-of-speech (PTT release)
     let transcript: string;
     try {
       transcript = (await this.stt.transcribe(pcm)).trim();
+      console.log(
+        `[latency] transcript ${Date.now() - t0}ms (${(pcm.byteLength / 32000).toFixed(1)}s of audio)`,
+      );
     } catch (err) {
       this.sink.sendWarning(`stt failed: ${String(err)}`);
       this.sink.sendState("degraded");
@@ -102,7 +106,7 @@ export class Session {
       this.sink.sendState("idle");
       return;
     }
-    void this.startTurn("voice", transcript);
+    void this.startTurn("voice", transcript, t0);
   }
 
   ack(seq: number): void {
@@ -151,7 +155,11 @@ export class Session {
     return lastWords ? lastWords.slice(-120) : null;
   }
 
-  private async startTurn(source: "voice" | "text", userText: string): Promise<void> {
+  private async startTurn(
+    source: "voice" | "text",
+    userText: string,
+    perceivedStart?: number,
+  ): Promise<void> {
     // New input during an active performance IS the barge-in path.
     let interruptPrefix = "";
     if (this.active) {
@@ -175,7 +183,13 @@ export class Session {
           }
           this.sink.sendItem(item);
         },
-        sendAudio: (t, seq, pcm) => this.sink.sendAudio(t, seq, pcm),
+        sendAudio: (t, seq, pcm) => {
+          if (perceivedStart !== undefined && !this.firstAudioLogged.has(turnId)) {
+            this.firstAudioLogged.add(turnId);
+            console.log(`[latency] first-audio ${Date.now() - perceivedStart}ms (perceived total)`);
+          }
+          this.sink.sendAudio(t, seq, pcm);
+        },
         sendWarning: (m) => this.sink.sendWarning(m),
       },
       ttsTextTransform: this.makePronunciationTransform(),
@@ -202,6 +216,10 @@ export class Session {
         execute: this.executor,
         callbacks: {
           onTextDelta: (delta) => {
+            if (perceivedStart !== undefined && !this.firstTokenLogged.has(turnId)) {
+              this.firstTokenLogged.add(turnId);
+              console.log(`[latency] first-token ${Date.now() - perceivedStart}ms`);
+            }
             compiler.push(delta);
             this.sink.sendState("speaking");
           },
@@ -236,6 +254,9 @@ export class Session {
       }
     }
   }
+
+  private firstTokenLogged = new Set<string>();
+  private firstAudioLogged = new Set<string>();
 
   // M0: no MCP servers, no tools. M2+ replaces these via setTools().
   private tools: ToolDef[] = [];
