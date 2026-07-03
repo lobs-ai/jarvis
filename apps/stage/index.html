@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>jarvis</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="stage">
+      <div id="exhibits"></div>
+      <aside id="rail">
+        <div id="transcript"></div>
+      </aside>
+      <footer id="console">
+        <div id="orb" title="tap to wake">
+          <div class="core"></div>
+          <div class="ring"></div>
+        </div>
+        <form id="inputForm" autocomplete="off">
+          <input id="input" type="text" placeholder="talk or type…" />
+        </form>
+        <div id="modes">
+          <button id="quietToggle" type="button" title="quiet mode: captions only">🔊</button>
+          <span id="conn" class="dot" title="connection"></span>
+        </div>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,265 @@
+import Anthropic from "@anthropic-ai/sdk";
+import type { PerformanceItem } from "@jarvis/protocol";
+import type { Config } from "./config.js";
+import { runTurn, type ToolDef, type ToolExecutor } from "./brain/loop.js";
+import { PerformanceCompiler } from "./performance/compiler.js";
+import { PerformanceQueue, type TtsLike } from "./performance/queue.js";
+import type { MemoryStore } from "./memory/store.js";
+
+export interface SttLike {
+  // 16 kHz mono PCM16 in, transcript out
+  transcribe(pcm: Uint8Array): Promise<string>;
+}
+
+export interface SessionSink {
+  sendItem(item: PerformanceItem): void;
+  sendAudio(turnId: string, seq: number, pcm: Uint8Array): void;
+  sendWarning(message: string): void;
+  sendState(orb: "idle" | "listening" | "thinking" | "speaking" | "acting" | "degraded"): void;
+  sendTurnBegin(turnId: string, source: "voice" | "text"): void;
+  sendTurnEnd(turnId: string): void;
+  sendHeard(turnId: string, text: string): void;
+}
+
+interface ActiveTurn {
+  turnId: string;
+  queue: PerformanceQueue;
+  abort: AbortController;
+  sayTextsPlayed: string[];
+}
+
+// One conversation, one user — audience of one. Owns history, turn lifecycle,
+// and barge-in arbitration.
+export class Session {
+  private history: Anthropic.MessageParam[] = [];
+  private active: ActiveTurn | null = null;
+  private quiet = false;
+  private turnCounter = 0;
+  private micChunks: Uint8Array[] = [];
+
+  constructor(
+    private readonly cfg: Config,
+    private readonly client: Anthropic,
+    private readonly sink: SessionSink,
+    private readonly store: MemoryStore,
+    private stt: SttLike | null,
+    private tts: TtsLike | null,
+  ) {}
+
+  setVoicePorts(stt: SttLike | null, tts: TtsLike | null): void {
+    this.stt = stt;
+    this.tts = tts;
+  }
+
+  setQuiet(quiet: boolean): void {
+    this.quiet = quiet;
+  }
+
+  handleTextInput(text: string): void {
+    void this.startTurn("text", text);
+  }
+
+  micBegin(): void {
+    this.micChunks = [];
+    this.sink.sendState("listening");
+  }
+
+  micFrame(pcm: Uint8Array): void {
+    this.micChunks.push(pcm);
+  }
+
+  micCancel(): void {
+    this.micChunks = [];
+    this.sink.sendState(this.active ? "speaking" : "idle");
+  }
+
+  async micEnd(): Promise<void> {
+    const chunks = this.micChunks;
+    this.micChunks = [];
+    if (!this.stt || chunks.length === 0) {
+      this.sink.sendState("idle");
+      return;
+    }
+    const total = chunks.reduce((n, c) => n + c.byteLength, 0);
+    const pcm = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      pcm.set(c, off);
+      off += c.byteLength;
+    }
+    this.sink.sendState("thinking");
+    let transcript: string;
+    try {
+      transcript = (await this.stt.transcribe(pcm)).trim();
+    } catch (err) {
+      this.sink.sendWarning(`stt failed: ${String(err)}`);
+      this.sink.sendState("degraded");
+      return;
+    }
+    if (!transcript) {
+      // design: Failure UX — empty STT gets a spoken shape via a canned local turn
+      this.sink.sendWarning("didn't catch that");
+      this.sink.sendState("idle");
+      return;
+    }
+    void this.startTurn("voice", transcript);
+  }
+
+  ack(seq: number): void {
+    this.active?.queue.ack(seq);
+    const say = this.active?.queue.performed.find(
+      (i) => i.kind === "say" && i.seq === seq,
+    );
+    if (say && say.kind === "say") this.active?.sayTextsPlayed.push(say.text);
+  }
+
+  interrupt(): void {
+    if (!this.active) return;
+    this.truncateInterrupted();
+  }
+
+  private nextTurnId(): string {
+    return `t${++this.turnCounter}`;
+  }
+
+  // Barge-in: abort generation, truncate history to what was performed.
+  private truncateInterrupted(): string | null {
+    const turn = this.active;
+    if (!turn) return null;
+    turn.abort.abort();
+    const performed = turn.queue.interrupt();
+    this.active = null;
+
+    const parts: string[] = [];
+    for (const item of performed) {
+      if (item.kind === "say") parts.push(item.text);
+      else if (item.kind === "show")
+        parts.push(serializeShow(item));
+      else if (item.kind === "update") parts.push(`<update ref="${item.ref}">…</update>`);
+      else if (item.kind === "dismiss") parts.push(`<dismiss ref="${item.ref}"/>`);
+    }
+    const performedText = parts.join(" ").trim();
+    if (performedText) {
+      this.history.push({ role: "assistant", content: performedText });
+    }
+    this.sink.sendTurnEnd(turn.turnId);
+    this.sink.sendState("idle");
+    this.store.append({ at: new Date().toISOString(), kind: "interrupt", text: performedText });
+
+    const played = turn.sayTextsPlayed;
+    const lastWords = played.length > 0 ? played[played.length - 1]! : performedText;
+    return lastWords ? lastWords.slice(-120) : null;
+  }
+
+  private async startTurn(source: "voice" | "text", userText: string): Promise<void> {
+    // New input during an active performance IS the barge-in path.
+    let interruptPrefix = "";
+    if (this.active) {
+      const lastWords = this.truncateInterrupted();
+      if (lastWords) {
+        interruptPrefix = `[you were interrupted while saying: "${lastWords}"] `;
+      }
+    }
+
+    const turnId = this.nextTurnId();
+    const abort = new AbortController();
+
+    const queue = new PerformanceQueue({
+      turnId,
+      tts: this.quiet ? null : this.tts,
+      sink: {
+        sendItem: (item) => {
+          if (item.kind === "say" && !this.tts) {
+            // M0/quiet: delivery == performed; track for barge-in last-words
+            this.active?.sayTextsPlayed.push(item.text);
+          }
+          this.sink.sendItem(item);
+        },
+        sendAudio: (t, seq, pcm) => this.sink.sendAudio(t, seq, pcm),
+        sendWarning: (m) => this.sink.sendWarning(m),
+      },
+      ttsTextTransform: this.makePronunciationTransform(),
+    });
+
+    const compiler = new PerformanceCompiler(turnId, {
+      onItem: (item) => queue.enqueue(item),
+      onWarning: (m) => this.sink.sendWarning(m),
+    });
+
+    this.active = { turnId, queue, abort, sayTextsPlayed: [] };
+    this.history.push({ role: "user", content: interruptPrefix + userText });
+    this.store.append({ at: new Date().toISOString(), kind: "user", text: userText });
+    this.sink.sendTurnBegin(turnId, source);
+    if (source === "voice") this.sink.sendHeard(turnId, userText);
+    this.sink.sendState("thinking");
+
+    try {
+      const result = await runTurn({
+        client: this.client,
+        model: this.cfg.model_tier1,
+        history: this.history,
+        tools: this.tools,
+        execute: this.executor,
+        callbacks: {
+          onTextDelta: (delta) => {
+            compiler.push(delta);
+            this.sink.sendState("speaking");
+          },
+          onToolCall: () => this.sink.sendState("acting"),
+        },
+        signal: abort.signal,
+      });
+      compiler.end();
+      queue.endOfItems();
+      await queue.whenDone();
+
+      if (!result.aborted && this.active?.turnId === turnId) {
+        this.history.push({ role: "assistant", content: result.fullText });
+        this.store.append({ at: new Date().toISOString(), kind: "assistant", text: result.fullText });
+        this.active = null;
+        this.sink.sendTurnEnd(turnId);
+        this.sink.sendState("idle");
+      }
+    } catch (err) {
+      if (this.active?.turnId === turnId) {
+        this.active = null;
+        // design: Failure UX — one canned apology + caption detail, never silent
+        this.sink.sendWarning(`brain error: ${String(err)}`);
+        this.sink.sendItem({
+          kind: "say",
+          seq: compiler.nextSeq,
+          turnId,
+          text: "Sorry — I hit an error mid-thought. Try that again?",
+        });
+        this.sink.sendTurnEnd(turnId);
+        this.sink.sendState("degraded");
+      }
+    }
+  }
+
+  // M0: no MCP servers, no tools. M2+ replaces these via setTools().
+  private tools: ToolDef[] = [];
+  private executor: ToolExecutor = async (name) => `no such tool: ${name}`;
+  setTools(tools: ToolDef[], executor: ToolExecutor): void {
+    this.tools = tools;
+    this.executor = executor;
+  }
+
+  private makePronunciationTransform(): (text: string) => string {
+    const map = this.store.pronunciationMap();
+    if (map.length === 0) return (t) => t;
+    return (text) => {
+      let out = text;
+      for (const [from, to] of map) out = out.split(from).join(to);
+      return out;
+    };
+  }
+}
+
+function serializeShow(item: Extract<PerformanceItem, { kind: "show" }>): string {
+  const e = item.exhibit;
+  const attrs = [`id="${item.id}"`, `type="${e.type}"`];
+  if (e.title) attrs.push(`title="${e.title}"`);
+  if (e.ref) attrs.push(`ref="${e.ref}"`);
+  return `<show ${attrs.join(" ")}/>`;
+}

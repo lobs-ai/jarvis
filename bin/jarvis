@@ -1,0 +1,119 @@
+#!/bin/bash
+# jarvis lifecycle: start | stop | restart | status [--build]
+# Extra: dev (vite HMR + jarvisd watch), logs, chrome (M4 hands profile)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RUN="$ROOT/.run"
+LOGS="$RUN/logs"
+mkdir -p "$RUN" "$LOGS"
+
+JARVISD_PID="$RUN/jarvisd.pid"
+STT_PID="$RUN/stt.pid"
+TTS_PID="$RUN/tts.pid"
+
+PORT="${JARVIS_PORT:-7430}"
+
+alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+
+start_proc() { # name pidfile logfile cmd...
+  local name="$1" pidfile="$2" logfile="$3"; shift 3
+  if alive "$pidfile"; then echo "  $name: already running (pid $(cat "$pidfile"))"; return; fi
+  ("$@" >>"$logfile" 2>&1 & echo $! >"$pidfile")
+  sleep 0.3
+  if alive "$pidfile"; then echo "  $name: started (pid $(cat "$pidfile"))"
+  else echo "  $name: FAILED — tail $logfile"; return 1; fi
+}
+
+stop_proc() { # name pidfile
+  local name="$1" pidfile="$2"
+  if alive "$pidfile"; then
+    kill "$(cat "$pidfile")" 2>/dev/null || true
+    sleep 0.3
+    kill -9 "$(cat "$pidfile")" 2>/dev/null || true
+    echo "  $name: stopped"
+  else
+    echo "  $name: not running"
+  fi
+  rm -f "$pidfile"
+}
+
+build_all() {
+  echo "═══ building ═══"
+  (cd "$ROOT" && pnpm install --silent && pnpm --filter @jarvis/stage build)
+}
+
+start_sidecars() {
+  # Sidecars are optional until M1 assets exist; start them if built.
+  if [ -x "$ROOT/sidecars/stt/start-stt.sh" ] && [ -f "$ROOT/sidecars/stt/whisper.cpp/build/bin/whisper-server" ]; then
+    start_proc "stt (:7423)" "$STT_PID" "$LOGS/stt.log" "$ROOT/sidecars/stt/start-stt.sh" || true
+  fi
+  if [ -x "$ROOT/sidecars/tts/start-tts.sh" ] && [ -f "$ROOT/sidecars/tts/.venv/bin/python" ]; then
+    start_proc "tts (:7422)" "$TTS_PID" "$LOGS/tts.log" "$ROOT/sidecars/tts/start-tts.sh" || true
+  fi
+}
+
+cmd_start() {
+  local do_build=0
+  [ "${1:-}" = "--build" ] && do_build=1
+  [ ! -d "$ROOT/apps/stage/dist" ] && do_build=1
+  [ ! -d "$ROOT/node_modules" ] && do_build=1
+  [ "$do_build" = 1 ] && build_all
+  echo "═══ jarvis start ═══"
+  start_sidecars
+  start_proc "jarvisd (:$PORT)" "$JARVISD_PID" "$LOGS/jarvisd.log" \
+    "$ROOT/apps/jarvisd/node_modules/.bin/tsx" "$ROOT/apps/jarvisd/src/main.ts"
+  echo "  stage:  http://127.0.0.1:$PORT"
+}
+
+cmd_stop() {
+  echo "═══ jarvis stop ═══"
+  stop_proc "jarvisd" "$JARVISD_PID"
+  stop_proc "stt" "$STT_PID"
+  stop_proc "tts" "$TTS_PID"
+}
+
+cmd_status() {
+  echo "═══ jarvis status ═══"
+  for entry in "jarvisd:$JARVISD_PID" "stt:$STT_PID" "tts:$TTS_PID"; do
+    name="${entry%%:*}"; pidfile="${entry#*:}"
+    if alive "$pidfile"; then echo "  $name: running (pid $(cat "$pidfile"))"
+    else echo "  $name: stopped"; fi
+  done
+  if curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
+    echo "  http:  ok (:$PORT)"
+  else
+    echo "  http:  unreachable (:$PORT)"
+  fi
+}
+
+cmd_dev() {
+  echo "═══ jarvis dev (ctrl-c stops both) ═══"
+  (cd "$ROOT" && pnpm install --silent)
+  trap 'kill 0' EXIT
+  (cd "$ROOT/apps/jarvisd" && ./node_modules/.bin/tsx watch src/main.ts) &
+  (cd "$ROOT/apps/stage" && pnpm dev) &
+  wait
+}
+
+cmd_chrome() {
+  # M4: Jarvis-owned Chrome profile for CDP hands (never Rafe's daily profile).
+  local profile="$HOME/.jarvis/chrome-profile"
+  mkdir -p "$profile"
+  echo "launching Jarvis-owned Chrome (CDP :9222, profile $profile)"
+  open -na "Google Chrome" --args \
+    --user-data-dir="$profile" \
+    --remote-debugging-port=9222 \
+    --no-first-run --no-default-browser-check
+}
+
+case "${1:-}" in
+  start) shift; cmd_start "$@" ;;
+  stop) cmd_stop ;;
+  restart) cmd_stop; cmd_start --build ;;
+  status) cmd_status ;;
+  dev) cmd_dev ;;
+  chrome) cmd_chrome ;;
+  logs) tail -f "$LOGS"/*.log ;;
+  *) echo "usage: jarvis start [--build] | stop | restart | status | dev | chrome | logs"; exit 1 ;;
+esac
