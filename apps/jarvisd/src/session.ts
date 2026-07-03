@@ -1,8 +1,7 @@
-import Anthropic from "@anthropic-ai/sdk";
 import type { PerformanceItem } from "@jarvis/protocol";
-import type { Config } from "./config.js";
-import { runTurn, type ToolDef, type ToolExecutor } from "./brain/loop.js";
+import { type ToolDef, type ToolExecutor } from "./brain/loop.js";
 import { UNTRUSTED_OPEN, UNTRUSTED_CLOSE } from "./brain/prompt.js";
+import type { BrainPort } from "./brain/port.js";
 import { PerformanceCompiler } from "./performance/compiler.js";
 import { PerformanceQueue, type TtsLike } from "./performance/queue.js";
 import type { MemoryStore } from "./memory/store.js";
@@ -31,18 +30,17 @@ interface ActiveTurn {
   sayTextsPlayed: string[];
 }
 
-// One conversation, one user — audience of one. Owns history, turn lifecycle,
-// and barge-in arbitration.
+// One conversation, one user — audience of one. Owns turn lifecycle, the
+// performance layer, and barge-in arbitration. Conversation history lives in
+// the BrainPort (Claude Code's warm session, or the SDK brain's message list).
 export class Session {
-  private history: Anthropic.MessageParam[] = [];
   private active: ActiveTurn | null = null;
   private quiet = false;
   private turnCounter = 0;
   private micChunks: Uint8Array[] = [];
 
   constructor(
-    private readonly cfg: Config,
-    private readonly client: Anthropic,
+    private readonly brain: BrainPort,
     private readonly sink: SessionSink,
     private readonly store: MemoryStore,
     private stt: SttLike | null,
@@ -74,8 +72,6 @@ export class Session {
     if (this.active || this.pendingAnnouncements.length === 0) return;
     const { text, report } = this.pendingAnnouncements.shift()!;
     const turnId = this.nextTurnId();
-    // announcements enter history so the model knows what it told Rafe
-    this.history.push({ role: "assistant", content: text });
     const queue = new PerformanceQueue({
       turnId,
       tts: this.quiet ? null : this.tts,
@@ -195,7 +191,8 @@ export class Session {
     return `t${++this.turnCounter}`;
   }
 
-  // Barge-in: abort generation, truncate history to what was performed.
+  // Barge-in: abort generation, tell the brain what was actually performed so
+  // its memory matches what Rafe heard.
   private truncateInterrupted(): string | null {
     const turn = this.active;
     if (!turn) return null;
@@ -212,9 +209,7 @@ export class Session {
       else if (item.kind === "dismiss") parts.push(`<dismiss ref="${item.ref}"/>`);
     }
     const performedText = parts.join(" ").trim();
-    if (performedText) {
-      this.history.push({ role: "assistant", content: performedText });
-    }
+    this.brain.recordInterrupted(performedText);
     this.sink.sendTurnEnd(turn.turnId);
     this.sink.sendState("idle");
     this.store.append({ at: new Date().toISOString(), kind: "interrupt", text: performedText });
@@ -270,32 +265,21 @@ export class Session {
     });
 
     this.active = { turnId, queue, abort, sayTextsPlayed: [] };
-    // History stores the PLAIN user text; the utterance bundle is attached to
-    // the API call for this turn only, never accumulated (design §Eyes).
-    this.history.push({ role: "user", content: interruptPrefix + userText });
     this.store.append({ at: new Date().toISOString(), kind: "user", text: userText });
     this.sink.sendTurnBegin(turnId, source);
     if (source === "voice") this.sink.sendHeard(turnId, userText);
     this.sink.sendState("thinking");
 
-    const apiHistory: Anthropic.MessageParam[] = [...this.history];
+    // The bundle (untrusted observed world-state) rides THIS turn only; the
+    // brain never accumulates it into history (design §Eyes).
     const bundle = await this.assembleBundle();
-    if (bundle) {
-      apiHistory[apiHistory.length - 1] = {
-        role: "user",
-        content: `${interruptPrefix}${userText}\n\n${bundle}`,
-      };
-    }
+    const composed =
+      interruptPrefix + userText + (bundle ? `\n\n${bundle}` : "");
 
     try {
-      const result = await runTurn({
-        client: this.client,
-        model: this.cfg.model_tier1,
-        history: apiHistory,
-        tools: this.tools,
-        execute: this.executor,
-        facts: this.store.readFacts(),
-        callbacks: {
+      const result = await this.brain.turn(
+        composed,
+        {
           onTextDelta: (delta) => {
             if (perceivedStart !== undefined && !this.firstTokenLogged.has(turnId)) {
               this.firstTokenLogged.add(turnId);
@@ -306,14 +290,13 @@ export class Session {
           },
           onToolCall: () => this.sink.sendState("acting"),
         },
-        signal: abort.signal,
-      });
+        abort.signal,
+      );
       compiler.end();
       queue.endOfItems();
       await queue.whenDone();
 
       if (!result.aborted && this.active?.turnId === turnId) {
-        this.history.push({ role: "assistant", content: result.fullText });
         this.store.append({ at: new Date().toISOString(), kind: "assistant", text: result.fullText });
         this.active = null;
         this.sink.sendTurnEnd(turnId);
@@ -340,12 +323,10 @@ export class Session {
   private firstTokenLogged = new Set<string>();
   private firstAudioLogged = new Set<string>();
 
-  // M0: no MCP servers, no tools. M2+ replaces these via setTools().
-  private tools: ToolDef[] = [];
-  private executor: ToolExecutor = async (name) => `no such tool: ${name}`;
+  // Tool wiring: forwarded to the brain. ApiBrain executes tools itself;
+  // CliBrain lets Claude Code call MCP servers directly.
   setTools(tools: ToolDef[], executor: ToolExecutor): void {
-    this.tools = tools;
-    this.executor = executor;
+    this.brain.setTools?.(tools, executor);
   }
 
   // Bundle: context-tool fan-out results wrapped as untrusted observed content,

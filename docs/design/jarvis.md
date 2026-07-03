@@ -270,7 +270,30 @@ apology plus caption detail; a downed MCP server → absent from context, and na
 the user asks for something that needs it ("my terminal eyes are down"). Captions render every
 say-item regardless, so the text trail survives any audio failure.
 
-### The two-tier brain
+### Brain backends (swappable port)
+
+The brain is a swappable `BrainPort`; each backend owns its own conversation state (Session
+drives turns + the performance layer, not history). Two ship, **CLI is the default**:
+
+- **`CliBrain` — rides Rafe's Claude Code subscription (no API key, no per-token billing).**
+  One *persistent* `claude -p --input-format stream-json --output-format stream-json
+  --include-partial-messages` process per session: MCP servers initialize once and stay warm, so
+  the CLI cold-start tax is paid once (~5s on the first turn) instead of every turn — which is
+  exactly why per-turn `claude -p` spawning, and squad-as-brain, were rejected for voice.
+  Measured warm first-item ≈1.8s; context carries across turns (the process holds the
+  conversation). Claude Code owns the agent loop and calls our MCP servers directly;
+  `content_block_delta` text feeds the performance compiler unchanged, so the inline stage markup
+  works identically. Env that would divert it to an API key / Bedrock / Vertex is stripped so it
+  always uses the OAuth subscription. Safety across the split: Claude may call reads +
+  `wiki_propose_edit`, but `wiki_commit` and browser `mutate` tools are withheld
+  (`--disallowedTools`) — when Claude proposes, jarvisd shows the diff, runs the confirm broker,
+  and commits via *its own* MCP client, so "nothing lands without your yes" holds even though
+  Claude owns the loop. Deferred on this path (API-only for now): tier-2 dispatch and
+  model-written `remember_fact`; facts are still *read* into every CLI turn.
+- **`ApiBrain` — Anthropic SDK fallback** (used only when the CLI is absent or `JARVIS_BRAIN=api`).
+  jarvisd owns the loop, tool execution, tier-2, and built-ins, as described below.
+
+### The two-tier brain (ApiBrain path)
 
 Tier 1, **conversation**: a direct streaming Anthropic API call with the aggregated MCP tools;
 first spoken sentence must leave for TTS well under a second after transcript. The model is
