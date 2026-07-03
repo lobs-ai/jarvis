@@ -359,6 +359,57 @@ async function main(): Promise<void> {
       res.end("GET or POST");
       return;
     }
+    // Health for the stage's status strip: live sidecar probes, cheap enough
+    // for a 10s poll from a handful of tabs.
+    if (url === "/status") {
+      void Promise.all([stt.healthy(), tts.healthy()]).then(([sttUp, ttsUp]) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            stt: sttUp,
+            tts: ttsUp,
+            brain: brain.kind,
+            active: session.isActive(),
+            uptime_s: Math.round(process.uptime()),
+          }),
+        );
+      });
+      return;
+    }
+    // Wiki browser endpoints (stage's wiki tab): thin text proxies over the
+    // wiki MCP server, which resolves wiki_dir live from config.
+    if (url === "/wiki/pages") {
+      void mcp.execute("wiki_list", {}).then(
+        (text) => {
+          res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+          res.end(text);
+        },
+        (err) => {
+          res.writeHead(500);
+          res.end(String(err));
+        },
+      );
+      return;
+    }
+    if (url === "/wiki/search") {
+      const q = new URL(req.url ?? "", "http://x").searchParams.get("q") ?? "";
+      if (!q.trim()) {
+        res.writeHead(400);
+        res.end("missing q");
+        return;
+      }
+      void mcp.execute("wiki_search", { query: q }).then(
+        (text) => {
+          res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+          res.end(text);
+        },
+        (err) => {
+          res.writeHead(500);
+          res.end(String(err));
+        },
+      );
+      return;
+    }
     // Exhibit ref resolver: <show ref="wiki:PATH"/> → the stage fetches here.
     if (url === "/ref") {
       const uri = new URL(req.url ?? "", "http://x").searchParams.get("uri") ?? "";

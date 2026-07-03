@@ -2,9 +2,10 @@
 // session.new → session.reset, then a live turn where the model reads its own
 // configuration through the settings MCP server (CLI child → HTTP → jarvisd).
 //
-// GOTCHA: jarvisd is audience-of-one — the NEWEST /ws connection wins. If the
-// stage is open in a browser, its auto-reconnect will replace this test's
-// socket and the test will see nothing. Close the stage tab first.
+// NOTE: jarvisd now broadcasts to every open /ws connection, so this test and
+// an open stage tab coexist — the tab no longer steals this socket. The flip
+// side: the turn this test drives ALSO plays on any open stage tab, so say/
+// audio output will speak aloud there. Close the stage tab if you want silence.
 import WebSocket from "ws";
 
 const ws = new WebSocket("ws://127.0.0.1:7430/ws");

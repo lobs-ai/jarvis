@@ -18,7 +18,12 @@ export class Exhibits {
     card.dataset.plainId = id;
 
     const header = document.createElement("header");
-    header.innerHTML = `<span>${escapeHtml(exhibit.title ?? id)}</span><span class="etype">${exhibit.type}</span>`;
+    header.innerHTML =
+      `<span class="etitle">${escapeHtml(exhibit.title ?? id)}</span>` +
+      `<span class="hmeta"><span class="etype">${escapeHtml(exhibit.type)}</span>` +
+      `<button class="close" type="button" title="Dismiss">✕</button></span>`;
+    // Local dismiss (same sweep path); there is no client→server dismiss message.
+    header.querySelector(".close")!.addEventListener("click", () => this.dismiss(turnId, id));
     const body = document.createElement("div");
     body.className = "body";
     this.render(body, exhibit);

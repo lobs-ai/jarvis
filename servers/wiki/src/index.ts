@@ -153,6 +153,15 @@ server.tool(
 );
 
 server.tool(
+  "wiki_list",
+  "List every wiki page path, one per line.",
+  {},
+  async () => ({
+    content: [{ type: "text", text: listPages().join("\n") || "(empty wiki)" }],
+  }),
+);
+
+server.tool(
   "wiki_context",
   "Ambient wiki context for the current turn: page inventory and recent changes.",
   {},

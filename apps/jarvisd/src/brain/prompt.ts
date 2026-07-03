@@ -105,9 +105,9 @@ pages there when the web has the answer; you can also search the web directly.
 
 Your own settings are tools too: settings_get shows your current configuration; \
 settings_set changes wiki_dir (where the wiki tools read), model_tier1 (the model you run \
-on), and thinking (your reasoning budget: off, low, medium, high). A wiki move applies \
-immediately; a model or thinking change restarts your conversation when the current turn \
-ends — say so out loud before flipping it, and only change settings when Rafe asks.`;
+on), and thinking (your reasoning effort: off, low, medium, high, xhigh, max). A wiki move \
+applies immediately; a model or thinking change restarts your conversation when the current \
+turn ends — say so out loud before flipping it, and only change settings when Rafe asks.`;
 
 const RULES = `## Standing rules
 

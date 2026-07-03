@@ -3,7 +3,9 @@ import { PerformanceItem } from "./performance.js";
 
 // Runtime-adjustable settings, shared by the stage UI, jarvisd's HTTP control
 // endpoints, and the settings MCP server — one schema, one writer (jarvisd).
-export const ThinkingLevel = z.enum(["off", "low", "medium", "high"]);
+// The five named levels are the Claude CLI's own --effort strings; "off" is
+// ours (MAX_THINKING_TOKENS=0), the voice-latency mode.
+export const ThinkingLevel = z.enum(["off", "low", "medium", "high", "xhigh", "max"]);
 export type ThinkingLevel = z.infer<typeof ThinkingLevel>;
 
 export const SettingsPatch = z.object({

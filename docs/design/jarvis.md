@@ -28,6 +28,20 @@ for usability and reliability; this one optimizes for the experience of working 
 
 ## 2. The Technical Plan
 
+### North star (added 2026-07-03, Rafe's direction)
+
+The stage is a waypoint, not the destination. End state: **no stage at all** — Jarvis controls
+real OS windows, so the flow is: global hotkey (or just unmuting the mic on a second screen),
+speak, and Jarvis pulls the right thing up *next to* whatever Rafe is working on. Fluid,
+ambient, no dedicated tab to babysit. Near-term implication: the browser view is now a
+**workspace of panels** where the stage (exhibits) is one panel among several (conversation,
+live activity, wiki browser, status) — content-dense, so the view earns its screen. The
+exhibits/performance abstraction is deliberately window-shaped: when window control arrives
+(AppleScript/CDP/native helper), "conjure an exhibit" becomes "open and place a window" and the
+compiler/queue layers carry over unchanged. jarvisd's WS went multi-connection the same day
+(any number of stage tabs/screens observe one session), which is the substrate the hotkey +
+second-screen flow needs.
+
 ### Design principle: audience of one
 
 Jarvis is built for exactly one user, on his own machines. This is a load-bearing
@@ -312,7 +326,8 @@ drives turns + the performance layer, not history). Two ship, **CLI is the defau
 
   **Settings + self-reconfiguration (2026-07-03).** Runtime-adjustable settings live in
   `~/.jarvis/config.toml`: `wiki_dir`, `model_tier1`, `model_tier2`, `thinking`
-  (off/low/medium/high → `MAX_THINKING_TOKENS` 0/4096/16384/32768 in the child env). jarvisd is
+  (`off` → `MAX_THINKING_TOKENS=0` in the child env; `low/medium/high/xhigh/max` → the CLI's
+  own `--effort` flag). jarvisd is
   the **single writer**; three surfaces funnel into one `applySettings`: the stage's ⚙ panel
   (WS `settings.get`/`settings.set`), plain HTTP (`GET`/`POST /settings`, localhost), and a
   `settings` MCP server whose `settings_get`/`settings_set` tools call that same HTTP endpoint —

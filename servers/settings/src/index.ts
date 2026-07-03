@@ -39,7 +39,10 @@ server.tool(
     wiki_dir: z.string().optional().describe("absolute path to the wiki's markdown root"),
     model_tier1: z.string().optional().describe("conversation model, e.g. claude-opus-4-8, claude-sonnet-5"),
     model_tier2: z.string().optional().describe("background-task model"),
-    thinking: z.enum(["off", "low", "medium", "high"]).optional().describe("extended-thinking budget"),
+    thinking: z
+      .enum(["off", "low", "medium", "high", "xhigh", "max"])
+      .optional()
+      .describe("thinking effort (off disables extended thinking; the rest are CLI --effort levels)"),
   },
   async (patch) => {
     try {

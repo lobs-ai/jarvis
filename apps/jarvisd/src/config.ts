@@ -10,8 +10,9 @@ const ConfigSchema = z.object({
   port: z.number().int().default(7430),
   model_tier1: z.string().default("claude-opus-4-8"), // Rafe's call: opus over sonnet's latency edge
   model_tier2: z.string().default("claude-fable-5"),
-  // extended-thinking budget for tier-1 (off measured 9s→2s ttft on opus)
-  thinking: z.enum(["off", "low", "medium", "high"]).default("off"),
+  // extended-thinking effort for tier-1: the CLI's --effort levels, plus our
+  // "off" (MAX_THINKING_TOKENS=0 — measured 9s→2s ttft on opus)
+  thinking: z.enum(["off", "low", "medium", "high", "xhigh", "max"]).default("off"),
   stt_url: z.string().default("http://127.0.0.1:7423"),
   tts_url: z.string().default("http://127.0.0.1:7422"),
   tts_voice: z.string().default("default"),

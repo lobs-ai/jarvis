@@ -11,25 +11,43 @@ import {
 } from "@jarvis/protocol";
 import type { Session, SessionSink } from "./session.js";
 
-// Audience of one: a single stage connection; a new one replaces the old.
+type Orb = Parameters<SessionSink["sendState"]>[0];
+
+// Broadcast bus: every open /ws connection is a live stage. All SessionSink
+// sends fan out to every open socket; input is accepted from any of them.
+//
+// (This replaced an "audience of one" design where each new connection closed
+// the previous — an open browser tab would steal the socket from a test client,
+// and two tabs thrashed by replacing each other on reconnect.) Consequence: a
+// text turn typed in one tab shows up in all of them, and say/audio output
+// plays through the speakers of EVERY open tab.
 export class StageSocket implements SessionSink {
-  private ws: WebSocket | null = null;
+  private sockets = new Set<WebSocket>();
   private session: Session | null = null;
   private audioStreamCounter = 0;
-  private lastOrb: string | null = null;
+  private lastOrb: Orb | null = null;
+  // played acks are deduped per turn: with N tabs, every say item is acked N
+  // times (once per tab that played it). Keyed turnId:seq; cleared at each
+  // turn.begin (seqs restart per turn), so session.ack fires exactly once.
+  private ackedThisTurn = new Set<string>();
 
   attach(server: HttpServer): void {
     const wss = new WebSocketServer({ server, path: "/ws" });
     wss.on("connection", (ws) => {
-      this.ws?.close(4000, "replaced by a newer stage connection");
-      this.ws = ws;
+      // Do NOT close existing connections — this tab joins the audience.
+      this.sockets.add(ws);
       ws.binaryType = "arraybuffer";
       ws.on("message", (data, isBinary) => this.onMessage(data as ArrayBuffer | string, isBinary));
-      ws.on("close", () => {
-        if (this.ws === ws) this.ws = null;
-      });
-      this.sendState("idle");
-      this.onConnect?.();
+      const drop = (): void => {
+        this.sockets.delete(ws);
+      };
+      ws.on("close", drop);
+      ws.on("error", drop);
+      // Per-socket welcome: the new tab must learn the current orb state even
+      // when it equals lastOrb (which the broadcast dedupe would swallow), so
+      // this goes straight to the new socket and bypasses sendState's dedupe.
+      this.sendTo(ws, { type: "state", orb: this.lastOrb ?? "idle" });
+      this.onConnect?.(); // main pushes a settings snapshot; broadcasting it is fine
     });
   }
 
@@ -41,6 +59,10 @@ export class StageSocket implements SessionSink {
     const session = this.session;
     if (!session) return;
     if (isBinary) {
+      // Mic frames are accepted from any socket. In practice only one tab has
+      // its mic on, so no arbitration is needed; two live mics would interleave
+      // their PCM into one utterance buffer — a documented limitation, not a
+      // supported mode.
       const { pcm } = decodeBinaryFrame(data as ArrayBuffer);
       session.micFrame(pcm);
       return;
@@ -74,9 +96,15 @@ export class StageSocket implements SessionSink {
       case "interrupt":
         session.interrupt();
         break;
-      case "played":
+      case "played": {
+        // Drop duplicate acks: with multiple tabs the same say item is reported
+        // played once per tab. Only the first reaches the queue's pacing.
+        const key = `${msg.turnId}:${msg.seq}`;
+        if (this.ackedThisTurn.has(key)) break;
+        this.ackedThisTurn.add(key);
         session.ack(msg.seq);
         break;
+      }
       case "confirm":
         this.onConfirm?.(msg.confirmId, msg.approve);
         break;
@@ -100,18 +128,35 @@ export class StageSocket implements SessionSink {
   onSettingsGet: (() => void) | null = null;
   onSettingsSet: ((patch: SettingsPatch) => void) | null = null;
 
-  private send(msg: ServerMessage): void {
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
+  private broadcast(msg: ServerMessage): void {
+    const data = JSON.stringify(msg);
+    for (const ws of this.sockets) {
+      if (ws.readyState === WebSocket.OPEN) ws.send(data);
+    }
+  }
+
+  private broadcastBinary(frame: Uint8Array): void {
+    for (const ws of this.sockets) {
+      if (ws.readyState === WebSocket.OPEN) ws.send(frame);
+    }
+  }
+
+  private sendTo(ws: WebSocket, msg: ServerMessage): void {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
   }
 
   // ── SessionSink ──────────────────────────────────────────────
   sendItem(item: PerformanceItem): void {
-    this.send({ type: "item", item });
+    this.broadcast({ type: "item", item });
   }
 
   sendAudio(turnId: string, seq: number, pcm: Uint8Array): void {
     const streamId = ++this.audioStreamCounter;
-    this.send({
+    // Announce then send the frame. Per socket these keep their order (each
+    // connection's send queue is FIFO), so the stage's audioMeta[streamId] is
+    // always set by the audio.segment before its binary frame arrives — the
+    // ordering assumption holds even though both messages are broadcast.
+    this.broadcast({
       type: "audio.segment",
       turnId,
       seq,
@@ -119,35 +164,34 @@ export class StageSocket implements SessionSink {
       sampleRate: 24000,
       bytes: pcm.byteLength,
     });
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(encodeBinaryFrame(streamId, seq, pcm));
-    }
+    this.broadcastBinary(encodeBinaryFrame(streamId, seq, pcm));
   }
 
   sendWarning(message: string): void {
-    this.send({ type: "error", message });
+    this.broadcast({ type: "error", message });
   }
 
-  sendState(orb: Parameters<SessionSink["sendState"]>[0]): void {
+  sendState(orb: Orb): void {
     if (orb === this.lastOrb) return; // dedupe: state is re-asserted on every token
     this.lastOrb = orb;
-    this.send({ type: "state", orb });
+    this.broadcast({ type: "state", orb });
   }
 
   sendTurnBegin(turnId: string, source: "voice" | "text"): void {
-    this.send({ type: "turn.begin", turnId, source });
+    this.ackedThisTurn.clear(); // new turn: seqs restart, so drop last turn's ack keys
+    this.broadcast({ type: "turn.begin", turnId, source });
   }
 
   sendTurnEnd(turnId: string): void {
-    this.send({ type: "turn.end", turnId });
+    this.broadcast({ type: "turn.end", turnId });
   }
 
   sendHeard(turnId: string, text: string): void {
-    this.send({ type: "heard", turnId, text });
+    this.broadcast({ type: "heard", turnId, text });
   }
 
   sendThought(turnId: string, text: string): void {
-    this.send({ type: "thought", turnId, text });
+    this.broadcast({ type: "thought", turnId, text });
   }
 
   sendConfirmRequest(
@@ -156,18 +200,18 @@ export class StageSocket implements SessionSink {
     detail: string | undefined,
     phrases: string[],
   ): void {
-    this.send({ type: "confirm.request", confirmId, summary, detail, phrases });
+    this.broadcast({ type: "confirm.request", confirmId, summary, detail, phrases });
   }
 
   sendConfirmResolved(confirmId: string, approved: boolean): void {
-    this.send({ type: "confirm.resolved", confirmId, approved });
+    this.broadcast({ type: "confirm.resolved", confirmId, approved });
   }
 
   sendSessionReset(): void {
-    this.send({ type: "session.reset" });
+    this.broadcast({ type: "session.reset" });
   }
 
   sendSettings(settings: SettingsSnapshot, note?: string): void {
-    this.send({ type: "settings", settings, note });
+    this.broadcast({ type: "settings", settings, note });
   }
 }

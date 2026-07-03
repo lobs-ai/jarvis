@@ -1,0 +1,68 @@
+import type { SettingsSnapshot } from "@jarvis/protocol";
+import { $ } from "../dom.js";
+import { modelLabel } from "../models.js";
+
+// The thin always-visible strip under the top bar. Left side: the live model /
+// thinking / wiki basename, sourced from the WS settings message. Right side:
+// sidecar health from GET /status (polled), rendered as tiny ok/down dots.
+export interface Health {
+  stt: boolean;
+  tts: boolean;
+  brain: "cli" | "api";
+  active: boolean;
+  uptime_s: number;
+}
+
+export class StatusStrip {
+  private model = $("#ssModel");
+  private thinking = $("#ssThinking");
+  private wiki = $("#ssWiki");
+  private earsDot = $("#ssEars .hdot");
+  private voiceDot = $("#ssVoice .hdot");
+  private brainDot = $("#ssBrain .hdot");
+  private brainKind = $("#ssBrainKind");
+  private uptime = $("#ssUptime");
+
+  setSettings(s: SettingsSnapshot): void {
+    this.model.textContent = modelLabel(s.model_tier1);
+    this.model.title = s.model_tier1;
+    this.thinking.textContent = s.thinking;
+    this.wiki.textContent = basename(s.wiki_dir);
+    this.wiki.title = s.wiki_dir;
+  }
+
+  // null → we couldn't reach /status (offline or endpoint missing): show unknown.
+  setHealth(h: Health | null): void {
+    if (!h) {
+      dot(this.earsDot, "unknown");
+      dot(this.voiceDot, "unknown");
+      dot(this.brainDot, "unknown");
+      this.brainKind.textContent = "brain";
+      this.uptime.textContent = "";
+      return;
+    }
+    dot(this.earsDot, h.stt ? "ok" : "down");
+    dot(this.voiceDot, h.tts ? "ok" : "down");
+    dot(this.brainDot, "ok");
+    this.brainKind.textContent = h.brain;
+    this.uptime.textContent = `up ${fmtUptime(h.uptime_s)}`;
+  }
+}
+
+function dot(el: HTMLElement, state: "ok" | "down" | "unknown"): void {
+  el.classList.remove("ok", "down", "unknown");
+  el.classList.add(state);
+}
+
+function basename(dir: string): string {
+  const trimmed = dir.replace(/\/+$/, "");
+  return trimmed.slice(trimmed.lastIndexOf("/") + 1) || trimmed || "—";
+}
+
+function fmtUptime(s: number): string {
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return m ? `${h}h ${m}m` : `${h}h`;
+}

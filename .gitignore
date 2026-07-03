@@ -2,8 +2,14 @@ node_modules/
 dist/
 *.log
 .DS_Store
-sidecars/stt/whisper.cpp/
-sidecars/stt/models/*.bin
-sidecars/tts/.venv/
-sidecars/tts/voices/*.wav
 .run/
+
+# Downloaded / generated model files — see setup.md
+sidecars/stt/whisper.cpp/
+sidecars/stt/.venv-coreml/
+sidecars/stt/models/*.bin
+sidecars/stt/models/*.mlmodelc/
+sidecars/tts/.venv/
+sidecars/tts/kokoro-v1.0.onnx
+sidecars/tts/voices-v1.0.bin
+sidecars/tts/voices/*.wav

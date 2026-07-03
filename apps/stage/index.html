@@ -8,54 +8,195 @@
   </head>
   <body>
     <div id="stage">
-      <div id="exhibits"></div>
-      <aside id="rail">
-        <div id="transcript"></div>
-      </aside>
+      <!-- ── top bar ───────────────────────────────────────────── -->
+      <header id="topbar">
+        <div class="brand">
+          <span class="brand-mark">JARVIS</span>
+          <span class="brand-sub">workspace</span>
+        </div>
+
+        <div id="status" class="status" data-state="connecting" title="What Jarvis is doing right now">
+          <span class="state-dot"></span>
+          <span id="stateLabel" class="state-label">connecting</span>
+        </div>
+
+        <div class="topbar-actions">
+          <button id="newConvo" class="pill" type="button" title="Clear the conversation and start fresh">
+            <span class="pill-icon">✚</span><span class="pill-label">New chat</span>
+          </button>
+          <button
+            id="settingsToggle"
+            class="pill"
+            type="button"
+            aria-expanded="false"
+            title="Open settings — model, thinking, wiki"
+          >
+            <span class="pill-icon">⚙</span><span class="pill-label">Settings</span>
+          </button>
+          <span id="conn" class="conn-dot" title="Connection to jarvisd"></span>
+        </div>
+      </header>
+
+      <!-- ── status strip ──────────────────────────────────────── -->
+      <div id="statusstrip">
+        <span class="ss-item"><span class="ss-key">model</span><span id="ssModel" class="ss-v">—</span></span>
+        <span class="ss-sep"></span>
+        <span class="ss-item"><span class="ss-key">thinking</span><span id="ssThinking" class="ss-v">—</span></span>
+        <span class="ss-sep"></span>
+        <span class="ss-item"><span class="ss-key">wiki</span><span id="ssWiki" class="ss-v">—</span></span>
+        <span class="ss-flex"></span>
+        <span class="ss-health">
+          <span class="ss-h" id="ssEars" title="speech-to-text"><span class="hdot unknown"></span>ears</span>
+          <span class="ss-h" id="ssVoice" title="text-to-speech"><span class="hdot unknown"></span>voice</span>
+          <span class="ss-h" id="ssBrain" title="brain path"><span class="hdot unknown"></span><span id="ssBrainKind">brain</span></span>
+          <span class="ss-h ss-uptime" id="ssUptime" title="daemon uptime"></span>
+        </span>
+      </div>
+
+      <!-- ── workspace of panels ───────────────────────────────── -->
+      <div id="workspace">
+        <!-- stage panel (exhibits) -->
+        <section class="panel" id="stagePanel">
+          <header class="panel-head">
+            <span class="panel-title">stage</span>
+            <button id="clearExhibits" class="panel-action hidden" type="button" title="Dismiss every exhibit">
+              <span class="pill-icon">⌫</span> Clear all
+            </button>
+          </header>
+          <div class="panel-body" id="exhibits">
+            <div id="exhibitsEmpty" class="empty">
+              <div class="empty-orb"></div>
+              <p>Exhibits Jarvis conjures will appear here.</p>
+              <p class="empty-sub">Ask for a table, a diagram, some code, or a wiki page.</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- tabbed side panel -->
+        <section class="panel" id="sidePanel">
+          <header class="panel-head tabbar" role="tablist">
+            <button class="tab" type="button" data-tab="conversation" role="tab" aria-selected="true">conversation</button>
+            <button class="tab" type="button" data-tab="activity" role="tab" aria-selected="false">activity</button>
+            <button class="tab" type="button" data-tab="wiki" role="tab" aria-selected="false">wiki</button>
+          </header>
+          <div class="panel-body" id="tabBody">
+            <!-- conversation -->
+            <div class="tabpane" data-pane="conversation" id="conversationPane">
+              <div id="transcript"></div>
+              <div id="transcriptEmpty" class="empty pane-empty">
+                <p>Talk or type below.</p>
+                <p class="empty-sub">Press <kbd>Space</kbd> for the mic, <kbd>Esc</kbd> to interrupt.</p>
+              </div>
+            </div>
+
+            <!-- activity -->
+            <div class="tabpane hidden" data-pane="activity" id="activityPane">
+              <div id="activity"></div>
+              <div id="activityEmpty" class="empty pane-empty">
+                <p>Jarvis's activity shows here.</p>
+                <p class="empty-sub">Thinking and tool calls, timestamped, turn by turn.</p>
+              </div>
+            </div>
+
+            <!-- wiki -->
+            <div class="tabpane hidden" data-pane="wiki" id="wikiPane">
+              <div class="wiki">
+                <div class="wiki-bar">
+                  <input class="wiki-search" type="search" spellcheck="false" placeholder="Search the wiki…" />
+                </div>
+                <div class="wiki-status hidden"></div>
+                <div class="wiki-scroll">
+                  <div class="wiki-results hidden"></div>
+                  <div class="wiki-pages-label wiki-section-label">Pages</div>
+                  <div class="wiki-pages"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- ── console ───────────────────────────────────────────── -->
       <footer id="console">
-        <div id="orb" title="click to interrupt">
+        <div id="orb" title="Click to interrupt Jarvis — or to jump to the input">
           <div class="core"></div>
           <div class="ring"></div>
         </div>
+
         <form id="inputForm" autocomplete="off">
-          <input id="input" type="text" placeholder="talk or type…" />
+          <input id="input" type="text" placeholder="Talk or type…   Space toggles the mic · Esc interrupts" />
         </form>
+
         <div id="modes">
-          <button id="micToggle" type="button" title="mic is off — click or Space to listen">🎙</button>
-          <div id="micLevel" class="muted" title="mic level"><div class="fill"></div></div>
-          <button id="quietToggle" type="button" title="quiet mode: captions only">🔊</button>
-          <button id="newConvo" type="button" title="new conversation">✚</button>
-          <button id="settingsToggle" type="button" title="settings">⚙</button>
-          <span id="conn" class="dot" title="connection"></span>
+          <button
+            id="micToggle"
+            class="control"
+            type="button"
+            aria-pressed="false"
+            title="Mic is off — click or press Space to listen"
+          >
+            <span class="control-icon">🎙</span>
+            <span class="control-text">
+              <span class="control-label">Mic</span>
+              <span id="micState" class="control-state">off</span>
+            </span>
+            <span id="micLevel" class="mic-level muted"><span class="fill"></span></span>
+          </button>
+
+          <button
+            id="quietToggle"
+            class="control on"
+            type="button"
+            aria-pressed="true"
+            title="Voice on — click for captions only"
+          >
+            <span class="control-icon">🔊</span>
+            <span class="control-text">
+              <span class="control-label">Voice</span>
+              <span id="quietState" class="control-state">on</span>
+            </span>
+          </button>
         </div>
       </footer>
-      <div id="settingsPanel" class="hidden">
-        <h3>settings</h3>
-        <label>model
-          <select id="setModel">
-            <option value="claude-opus-4-8">opus 4.8</option>
-            <option value="claude-sonnet-5">sonnet 5</option>
-            <option value="claude-fable-5">fable 5</option>
-            <option value="claude-haiku-4-5">haiku 4.5</option>
-          </select>
-        </label>
-        <label>thinking
-          <select id="setThinking">
-            <option value="off">off</option>
-            <option value="low">low</option>
-            <option value="medium">medium</option>
-            <option value="high">high</option>
-          </select>
-        </label>
-        <label>wiki location
-          <input id="setWiki" type="text" spellcheck="false" placeholder="/path/to/wiki" />
-        </label>
-        <div class="row">
-          <button id="setApply" type="button">apply</button>
-          <span class="hint">model &amp; thinking start a fresh conversation</span>
+
+      <!-- ── settings drawer ───────────────────────────────────── -->
+      <div id="settingsScrim" class="scrim"></div>
+      <aside id="settingsDrawer" class="drawer" aria-hidden="true" aria-label="Settings">
+        <header class="drawer-head">
+          <h2>Settings</h2>
+          <button id="settingsClose" class="icon-btn" type="button" title="Close (Esc)">✕</button>
+        </header>
+
+        <div class="drawer-body">
+          <label class="field">
+            <span class="field-label">Model</span>
+            <select id="setModel"></select>
+            <span class="field-hint">The brain Jarvis thinks with.</span>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Thinking</span>
+            <select id="setThinking"></select>
+            <span class="field-hint">How hard Jarvis deliberates before answering.</span>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Wiki location</span>
+            <input id="setWiki" type="text" spellcheck="false" placeholder="/path/to/wiki" />
+            <span class="field-hint">The folder Jarvis reads and writes as its notebook.</span>
+          </label>
         </div>
-      </div>
+
+        <footer class="drawer-foot">
+          <p class="drawer-note">Changing the model or thinking level starts a fresh conversation.</p>
+          <button id="setApply" class="pill primary" type="button" disabled>Apply</button>
+        </footer>
+      </aside>
+
+      <!-- ── toasts ────────────────────────────────────────────── -->
+      <div id="toasts" class="toasts" aria-live="polite"></div>
     </div>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

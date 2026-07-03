@@ -1,3 +1,4 @@
+import type { ThinkingLevel } from "@jarvis/protocol";
 import type { ToolDef, ToolExecutor } from "./loop.js";
 
 export interface BrainCallbacks {
@@ -27,9 +28,9 @@ export interface BrainPort {
   // call MCP servers directly and ignores the executor (it still uses the defs
   // to know which tools exist).
   setTools?(tools: ToolDef[], executor: ToolExecutor): void;
-  // Settings: adopt a new model/thinking budget. Takes effect on the next
+  // Settings: adopt a new model/thinking effort. Takes effect on the next
   // reset() (CliBrain bakes both into the child's spawn args/env).
-  configure?(patch: { model?: string; thinking?: "off" | "low" | "medium" | "high" }): void;
+  configure?(patch: { model?: string; thinking?: ThinkingLevel }): void;
   // Drop conversation history and start fresh on the next turn.
   reset?(): void;
   dispose?(): void;

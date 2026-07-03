@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { ThinkingLevel } from "@jarvis/protocol";
 import { buildSystemPrompt } from "./prompt.js";
 import type { BrainPort, BrainCallbacks } from "./port.js";
 
@@ -47,16 +48,9 @@ export interface CliBrainOptions {
   facts: () => string | null;
 }
 
-type ThinkingLevel = "off" | "low" | "medium" | "high";
-
-// Claude Code reads MAX_THINKING_TOKENS from the child env; 0 disables
+// Thinking: the five named levels are Claude Code's own --effort strings
+// (low/medium/high/xhigh/max). "off" is ours — MAX_THINKING_TOKENS=0 disables
 // extended thinking entirely (opus defaults it ON — measured ~9s dead air).
-const THINKING_TOKENS: Record<ThinkingLevel, string> = {
-  off: "0",
-  low: "4096",
-  medium: "16384",
-  high: "32768",
-};
 
 interface ActiveTurn {
   cb: BrainCallbacks;
@@ -125,15 +119,16 @@ export class CliBrain implements BrainPort {
       "--allowedTools", this.opts.allowedTools.join(","),
       "--disallowedTools", this.opts.disallowedTools.join(","),
     ];
+    if (this.thinking !== "off") args.push("--effort", this.thinking);
 
     const env: Record<string, string> = {};
     for (const [k, v] of Object.entries(process.env)) {
       if (typeof v === "string" && !CLEAR_ENV.includes(k)) env[k] = v;
     }
-    // Thinking budget comes from settings (default off — design §Brain: Claude
-    // Code defaults opus to extended thinking, measured ~9s of dead air).
-    // Deltas stream into the stage's thought line when it's on.
-    env.MAX_THINKING_TOKENS = THINKING_TOKENS[this.thinking];
+    // Thinking comes from settings (default off — design §Brain: Claude Code
+    // defaults opus to extended thinking, measured ~9s of dead air). Named
+    // levels ride --effort above; deltas stream into the stage's thought line.
+    if (this.thinking === "off") env.MAX_THINKING_TOKENS = "0";
 
     const child = spawn(this.opts.binary ?? "claude", args, {
       env,
