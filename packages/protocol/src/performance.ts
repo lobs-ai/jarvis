@@ -67,6 +67,15 @@ export const PerformanceItem = z.discriminatedUnion("kind", [
     turnId: z.string(),
     ref: z.string(), // exhibit id or "all"
   }),
+  // Maximize an exhibit into the stage lightbox (ref "none" restores). zoom is
+  // an optional magnification; Rafe can also zoom/pan by hand — last input wins.
+  z.object({
+    kind: z.literal("focus"),
+    seq: z.number().int().nonnegative(),
+    turnId: z.string(),
+    ref: z.string(), // exhibit id, or "none" to close the lightbox
+    zoom: z.number().positive().max(8).optional(),
+  }),
   z.object({
     kind: z.literal("act"),
     seq: z.number().int().nonnegative(),

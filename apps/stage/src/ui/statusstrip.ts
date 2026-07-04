@@ -55,8 +55,12 @@ function dot(el: HTMLElement, state: "ok" | "down" | "unknown"): void {
 }
 
 function basename(dir: string): string {
-  const trimmed = dir.replace(/\/+$/, "");
-  return trimmed.slice(trimmed.lastIndexOf("/") + 1) || trimmed || "—";
+  const parts = dir.replace(/\/+$/, "").split("/").filter(Boolean);
+  if (parts.length === 0) return "—";
+  const last = parts[parts.length - 1]!;
+  // a bare "wiki" says nothing — include the parent (personal-wiki/wiki)
+  if (last === "wiki" && parts.length > 1) return `${parts[parts.length - 2]}/${last}`;
+  return last;
 }
 
 function fmtUptime(s: number): string {

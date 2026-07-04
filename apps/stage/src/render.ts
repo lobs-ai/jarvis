@@ -17,6 +17,7 @@ import typescript from "highlight.js/lib/languages/typescript";
 import xml from "highlight.js/lib/languages/xml";
 import yaml from "highlight.js/lib/languages/yaml";
 import mermaid from "mermaid";
+import { reloadOnChunkFailure } from "./reload.js";
 
 hljs.registerLanguage("bash", bash);
 hljs.registerAliases(["sh", "zsh", "shell", "console"], { languageName: "bash" });
@@ -37,22 +38,89 @@ hljs.registerAliases(["html"], { languageName: "xml" });
 hljs.registerLanguage("yaml", yaml);
 hljs.registerAliases(["yml", "toml"], { languageName: "yaml" });
 
+// Stage-native mermaid skin. The stock "dark" theme leaves flat gray subgraph
+// slabs and mismatched fills — "base" hands every color over to us, and
+// themeCSS adds what variables can't reach (rounded nodes, teal glow, soft
+// cluster tints). Same engine, Jarvis's look.
+const INK = "#d7e2f2";
+const INK_DIM = "#7d8ca3";
+const TEAL = "#37d3c2";
+const SKY = "#5aa7ff";
+const SURFACE = "#101a2e";
+const SURFACE_DEEP = "#0b1220";
+
 mermaid.initialize({
   startOnLoad: false,
-  theme: "dark",
+  theme: "base",
   fontFamily: '-apple-system, "SF Pro Text", "Helvetica Neue", sans-serif',
+  flowchart: { curve: "basis", nodeSpacing: 42, rankSpacing: 48, padding: 10 },
   themeVariables: {
     darkMode: true,
-    background: "#0b1220",
-    primaryColor: "#101a2e",
-    primaryTextColor: "#d7e2f2",
-    primaryBorderColor: "#37d3c2",
-    secondaryColor: "#0b1220",
-    tertiaryColor: "#081020",
-    lineColor: "#5aa7ff",
-    textColor: "#d7e2f2",
+    background: "transparent",
     fontSize: "14px",
+    // nodes
+    primaryColor: SURFACE,
+    primaryTextColor: INK,
+    primaryBorderColor: "rgba(55, 211, 194, 0.55)",
+    secondaryColor: SURFACE_DEEP,
+    secondaryBorderColor: "rgba(90, 167, 255, 0.4)",
+    secondaryTextColor: INK,
+    tertiaryColor: "rgba(90, 167, 255, 0.07)",
+    tertiaryBorderColor: "rgba(90, 167, 255, 0.25)",
+    tertiaryTextColor: INK,
+    mainBkg: SURFACE,
+    nodeBorder: "rgba(55, 211, 194, 0.55)",
+    nodeTextColor: INK,
+    // edges + labels
+    lineColor: "rgba(90, 167, 255, 0.75)",
+    textColor: INK,
+    edgeLabelBackground: SURFACE_DEEP,
+    // subgraphs/clusters (the flat gray slabs in the stock theme)
+    clusterBkg: "rgba(90, 167, 255, 0.06)",
+    clusterBorder: "rgba(90, 167, 255, 0.28)",
+    titleColor: TEAL,
+    // sequence diagrams
+    actorBkg: SURFACE,
+    actorBorder: "rgba(55, 211, 194, 0.55)",
+    actorTextColor: INK,
+    actorLineColor: INK_DIM,
+    signalColor: INK,
+    signalTextColor: INK,
+    labelBoxBkgColor: SURFACE_DEEP,
+    labelBoxBorderColor: "rgba(90, 167, 255, 0.28)",
+    labelTextColor: INK,
+    loopTextColor: INK,
+    noteBkgColor: "rgba(255, 179, 90, 0.12)",
+    noteBorderColor: "rgba(255, 179, 90, 0.4)",
+    noteTextColor: INK,
+    activationBkgColor: "rgba(55, 211, 194, 0.15)",
+    activationBorderColor: TEAL,
+    // pie / charts: teal→sky ramp instead of default rainbow
+    pie1: TEAL, pie2: SKY, pie3: "#6fe3a5", pie4: "#ffb35a",
+    pie5: "#9ef3ea", pie6: "#b8d9ff", pie7: "#1d7d74", pie8: "#14488f",
+    pieTitleTextColor: INK,
+    pieSectionTextColor: INK,
+    pieLegendTextColor: INK,
+    pieStrokeColor: SURFACE_DEEP,
+    pieOuterStrokeColor: "rgba(90, 167, 255, 0.28)",
+    // gantt/timeline odds and ends
+    gridColor: "rgba(125, 140, 163, 0.2)",
+    todayLineColor: TEAL,
   },
+  themeCSS: `
+    .node rect, .node polygon, .node circle, .node ellipse {
+      rx: 8px; ry: 8px;
+      filter: drop-shadow(0 0 6px rgba(55, 211, 194, 0.18));
+    }
+    .cluster rect { rx: 12px; ry: 12px; }
+    .cluster-label .nodeLabel, .cluster-label span {
+      fill: ${TEAL}; color: ${TEAL};
+      font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+    }
+    .edgePaths path { stroke-width: 1.4px; }
+    .edgeLabel { border-radius: 4px; }
+    .nodeLabel, .edgeLabel { font-weight: 500; }
+  `,
 });
 
 const marked = new Marked(
@@ -110,6 +178,9 @@ function hydrateMermaid(el: HTMLElement): void {
       })
       .catch((err: unknown) => {
         document.getElementById(`d${id}`)?.remove(); // mermaid's leftover error node
+        // A rebuild may have removed this bundle's lazy diagram chunk — reload
+        // onto the current bundle rather than reporting a dead diagram.
+        if (reloadOnChunkFailure(err)) return;
         const note = document.createElement("div");
         note.className = "placeholder";
         note.textContent = `diagram error: ${String(err).slice(0, 200)}`;

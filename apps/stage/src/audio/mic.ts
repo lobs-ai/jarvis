@@ -1,7 +1,8 @@
 // Greenfield mic capture (no browser ancestor exists — design §Voice ports):
 // getUserMedia → lowpass biquad (anti-alias) → AudioWorklet tap → linear
-// resample to 16 kHz → PCM16 frames upstream. The mic switch turns capture on
-// and off; the endpointer downstream decides what becomes an utterance.
+// resample to 16 kHz → PCM16 frames upstream. Turning the switch off fully
+// disarms — the OS device is released so the browser's "in use" indicator
+// clears; the endpointer downstream decides what becomes an utterance.
 
 const WORKLET_JS = `
 class MicTap extends AudioWorkletProcessor {
@@ -64,8 +65,22 @@ export class Mic {
     if (this.ctx?.state === "suspended") void this.ctx.resume();
   }
 
-  end(): void {
+  // Full teardown. Stopping the track is what actually clears the browser's
+  // mic-in-use indicator — track.enabled=false or just gating frames keeps the
+  // device open. Nulling ctx also resets arm()'s `if (this.ctx) return` guard
+  // so the next toggle-on re-acquires cleanly.
+  disarm(): void {
     this.capturing = false;
+    if (this.node) {
+      this.node.port.onmessage = null;
+      this.node.disconnect();
+      this.node = null;
+    }
+    this.stream?.getTracks().forEach((t) => t.stop());
+    this.stream = null;
+    void this.ctx?.close();
+    this.ctx = null;
+    this.resampleCarry = 0;
   }
 
   private resampleTo16k(input: Float32Array, inputRate: number): Uint8Array {

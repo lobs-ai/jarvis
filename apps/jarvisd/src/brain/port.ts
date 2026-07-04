@@ -33,5 +33,9 @@ export interface BrainPort {
   configure?(patch: { model?: string; thinking?: ThinkingLevel }): void;
   // Drop conversation history and start fresh on the next turn.
   reset?(): void;
+  // Spawn/prepare the backend ahead of the first turn (CliBrain: start the
+  // child now so its MCP servers — including say — are registered before a
+  // turn arrives; a cold child raced the first turn and say wasn't there yet).
+  warm?(): void;
   dispose?(): void;
 }

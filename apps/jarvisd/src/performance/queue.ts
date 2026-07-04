@@ -1,5 +1,9 @@
 import type { PerformanceItem } from "@jarvis/protocol";
 
+// Slack on top of an audio segment's real duration before the queue advances
+// without a played ack (send latency + playback start + scheduling).
+const ACK_GRACE_MS = 3000;
+
 // Minimal structural interface; @jarvis/voice's ChatterboxTts satisfies it.
 export interface TtsLike {
   // returns 24kHz mono PCM16 bytes for the given text
@@ -139,8 +143,26 @@ export class PerformanceQueue {
       sink.sendItem(item);
       if (pcm && pcm.byteLength > 0) {
         sink.sendAudio(item.turnId, item.seq, pcm);
-        // wait until the stage reports playback finished (or interrupt)
-        await new Promise<void>((resolve) => this.acks.set(item.seq, resolve));
+        // Wait until the stage reports playback finished — but a browser tab
+        // is not a reliable component: it can close mid-say, sleep, or not
+        // exist at all, and a turn must NEVER hang on a missing ack (a closed
+        // tab once wedged a turn for two hours). The audio's own duration
+        // (PCM16 mono @ 24kHz) plus grace bounds the wait; acks tighten
+        // pacing, the deadline guarantees liveness.
+        const durationMs = (pcm.byteLength / 2 / 24_000) * 1000;
+        await new Promise<void>((resolve) => {
+          const deadline = setTimeout(() => {
+            this.acks.delete(item.seq);
+            console.log(
+              `[queue] no played-ack for ${item.turnId}:${item.seq} after ${Math.round(durationMs + ACK_GRACE_MS)}ms — advancing`,
+            );
+            resolve();
+          }, durationMs + ACK_GRACE_MS);
+          this.acks.set(item.seq, () => {
+            clearTimeout(deadline);
+            resolve();
+          });
+        });
       }
       return;
     }

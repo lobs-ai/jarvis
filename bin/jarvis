@@ -40,6 +40,10 @@ stop_proc() { # name pidfile
 
 build_all() {
   echo "═══ building ═══"
+  # Old hashed assets are kept across builds (vite emptyOutDir:false) so open
+  # tabs can still lazy-load their mermaid chunks after a rebuild; prune the
+  # ones no tab could plausibly still want.
+  find "$ROOT/apps/stage/dist/assets" -type f -mtime +7 -delete 2>/dev/null || true
   (cd "$ROOT" && pnpm install --silent && pnpm --filter @jarvis/stage build)
 }
 

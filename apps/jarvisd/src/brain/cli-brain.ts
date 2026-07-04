@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ThinkingLevel } from "@jarvis/protocol";
 import { buildSystemPrompt } from "./prompt.js";
+import { snapshotWiki } from "./wiki-index.js";
 import type { BrainPort, BrainCallbacks } from "./port.js";
 
 // Env vars that would steer the Claude CLI to an API key / Bedrock / Vertex
@@ -104,6 +105,7 @@ export class CliBrain implements BrainPort {
       ),
     };
     const model = MODEL_ALIAS[this.model] ?? this.model;
+    const wikiDir = this.opts.wikiDir?.();
     const args = [
       "-p",
       "--input-format", "stream-json",
@@ -113,7 +115,9 @@ export class CliBrain implements BrainPort {
       "--setting-sources", "user",
       "--permission-mode", "bypassPermissions",
       "--model", model,
-      "--append-system-prompt", CLI_PREAMBLE + buildSystemPrompt("say-tool", this.opts.wikiDir?.()),
+      "--append-system-prompt",
+      CLI_PREAMBLE +
+        buildSystemPrompt("say-tool", wikiDir, wikiDir ? snapshotWiki(wikiDir) : undefined),
       "--mcp-config", JSON.stringify(mcpConfig),
       "--strict-mcp-config",
       "--allowedTools", this.opts.allowedTools.join(","),
@@ -129,6 +133,10 @@ export class CliBrain implements BrainPort {
     // defaults opus to extended thinking, measured ~9s of dead air). Named
     // levels ride --effort above; deltas stream into the stage's thought line.
     if (this.thinking === "off") env.MAX_THINKING_TOKENS = "0";
+    // Claude Code 2.1.x defers ALL MCP tools behind ToolSearch by default —
+    // including say, so the model had to search for its own voice (measured:
+    // init listed zero mcp__ tools). Our surface is ~10 tools; pin them all.
+    env.ENABLE_TOOL_SEARCH = "false";
 
     const child = spawn(this.opts.binary ?? "claude", args, {
       env,
@@ -375,6 +383,12 @@ export class CliBrain implements BrainPort {
   configure(patch: { model?: string; thinking?: ThinkingLevel }): void {
     if (patch.model) this.model = patch.model;
     if (patch.thinking) this.thinking = patch.thinking;
+  }
+
+  // Spawn the child now (boot / right after reset) so MCP servers connect
+  // before the first turn — a turn racing a cold child found say unregistered.
+  warm(): void {
+    this.ensureChild();
   }
 
   // Fresh conversation: kill the warm child (its process IS the history) and

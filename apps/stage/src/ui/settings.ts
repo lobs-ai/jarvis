@@ -17,6 +17,8 @@ export class Settings {
   private closeBtn = $<HTMLButtonElement>("#settingsClose");
   private model = $<HTMLSelectElement>("#setModel");
   private thinking = $<HTMLSelectElement>("#setThinking");
+  private model2 = $<HTMLSelectElement>("#setModel2");
+  private thinking2 = $<HTMLSelectElement>("#setThinking2");
   private wiki = $<HTMLInputElement>("#setWiki");
   private apply = $<HTMLButtonElement>("#setApply");
   private snapshot: SettingsSnapshot | null = null;
@@ -24,10 +26,12 @@ export class Settings {
   constructor(private readonly host: SettingsHost) {
     fillOptions(this.model, MODEL_OPTIONS);
     fillOptions(this.thinking, THINKING_OPTIONS);
+    fillOptions(this.model2, MODEL_OPTIONS);
+    fillOptions(this.thinking2, THINKING_OPTIONS);
     this.toggleBtn.addEventListener("click", () => this.toggle());
     this.closeBtn.addEventListener("click", () => this.close());
     this.scrim.addEventListener("click", () => this.close());
-    for (const el of [this.model, this.thinking, this.wiki]) {
+    for (const el of [this.model, this.thinking, this.model2, this.thinking2, this.wiki]) {
       el.addEventListener("input", () => this.refreshDirty());
       el.addEventListener("change", () => this.refreshDirty());
     }
@@ -43,14 +47,12 @@ export class Settings {
   // so it can still be shown and re-selected.
   populate(s: SettingsSnapshot): void {
     this.snapshot = s;
-    if (![...this.model.options].some((o) => o.value === s.model_tier1)) {
-      const opt = document.createElement("option");
-      opt.value = s.model_tier1;
-      opt.textContent = s.model_tier1;
-      this.model.appendChild(opt);
-    }
+    ensureOption(this.model, s.model_tier1);
+    ensureOption(this.model2, s.model_tier2);
     this.model.value = s.model_tier1;
     this.thinking.value = s.thinking;
+    this.model2.value = s.model_tier2;
+    this.thinking2.value = s.thinking_tier2;
     this.wiki.value = s.wiki_dir;
     this.refreshDirty();
   }
@@ -83,6 +85,9 @@ export class Settings {
     if (this.model.value !== s.model_tier1) patch.model_tier1 = this.model.value;
     if (this.thinking.value !== s.thinking)
       patch.thinking = this.thinking.value as SettingsPatch["thinking"];
+    if (this.model2.value !== s.model_tier2) patch.model_tier2 = this.model2.value;
+    if (this.thinking2.value !== s.thinking_tier2)
+      patch.thinking_tier2 = this.thinking2.value as SettingsPatch["thinking_tier2"];
     const wiki = this.wiki.value.trim();
     if (wiki && wiki !== s.wiki_dir) patch.wiki_dir = wiki;
     return patch;
@@ -97,6 +102,16 @@ export class Settings {
     if (Object.keys(patch).length > 0) this.host.onApply(patch);
     this.close();
   }
+}
+
+// A model outside the preset list (config-file edits, future models) is
+// injected as an option so it can still be shown and re-selected.
+function ensureOption(sel: HTMLSelectElement, value: string): void {
+  if ([...sel.options].some((o) => o.value === value)) return;
+  const opt = document.createElement("option");
+  opt.value = value;
+  opt.textContent = value;
+  sel.appendChild(opt);
 }
 
 function fillOptions(sel: HTMLSelectElement, options: Option[]): void {

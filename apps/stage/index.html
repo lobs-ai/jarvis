@@ -181,6 +181,18 @@
           </label>
 
           <label class="field">
+            <span class="field-label">Background model</span>
+            <select id="setModel2"></select>
+            <span class="field-hint">The worker long tasks are handed to.</span>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Background thinking</span>
+            <select id="setThinking2"></select>
+            <span class="field-hint">Deliberation is free off the voice path — go high.</span>
+          </label>
+
+          <label class="field">
             <span class="field-label">Wiki location</span>
             <input id="setWiki" type="text" spellcheck="false" placeholder="/path/to/wiki" />
             <span class="field-hint">The folder Jarvis reads and writes as its notebook.</span>
@@ -188,10 +200,29 @@
         </div>
 
         <footer class="drawer-foot">
-          <p class="drawer-note">Changing the model or thinking level starts a fresh conversation.</p>
+          <p class="drawer-note">Changing the model, thinking, or wiki starts a fresh conversation. Background settings apply live.</p>
           <button id="setApply" class="pill primary" type="button" disabled>Apply</button>
         </footer>
       </aside>
+
+      <!-- ── exhibit lightbox ──────────────────────────────────── -->
+      <div id="lightbox" class="lightbox" aria-hidden="true">
+        <div class="lb-panel">
+          <header class="lb-head">
+            <span id="lbTitle" class="lb-title">exhibit</span>
+            <div class="lb-tools">
+              <button id="lbOut" class="lb-btn" type="button" title="Zoom out">−</button>
+              <span id="lbZoom" class="lb-zoom">100%</span>
+              <button id="lbIn" class="lb-btn" type="button" title="Zoom in">+</button>
+              <button id="lbFit" class="lb-btn" type="button" title="Fit to view">Fit</button>
+              <button id="lbClose" class="lb-btn lb-close" type="button" title="Close (Esc)">✕</button>
+            </div>
+          </header>
+          <div id="lbViewport" class="lb-viewport">
+            <div id="lbContent" class="lb-content"></div>
+          </div>
+        </div>
+      </div>
 
       <!-- ── toasts ────────────────────────────────────────────── -->
       <div id="toasts" class="toasts" aria-live="polite"></div>

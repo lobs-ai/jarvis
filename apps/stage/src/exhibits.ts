@@ -6,11 +6,21 @@ import { renderMarkdown, renderCode, escapeHtml } from "./render.js";
 export class Exhibits {
   private byKey = new Map<string, HTMLElement>();
 
-  constructor(private readonly root: HTMLElement) {}
+  constructor(
+    private readonly root: HTMLElement,
+    // maximize a card into the lightbox; close the lightbox if a focused card is
+    // about to be replaced/swept away (so it lands back in the grid, not the overlay)
+    private readonly onMaximize?: (card: HTMLElement) => void,
+    private readonly onEvict?: (card: HTMLElement) => void,
+  ) {}
 
   show(turnId: string, id: string, exhibit: Exhibit): void {
     const key = `${turnId}:${id}`;
-    this.byKey.get(key)?.remove();
+    const existing = this.byKey.get(key);
+    if (existing) {
+      this.onEvict?.(existing);
+      existing.remove();
+    }
 
     const card = document.createElement("div");
     card.className = "exhibit";
@@ -26,6 +36,11 @@ export class Exhibits {
     header.querySelector(".close")!.addEventListener("click", () => this.dismiss(turnId, id));
     const body = document.createElement("div");
     body.className = "body";
+    // Click the exhibit itself to maximize it into the lightbox — no button needed.
+    // (Ignored while already maximized so panning/zooming in the lightbox doesn't refit.)
+    body.addEventListener("click", () => {
+      if (!card.classList.contains("in-lightbox")) this.onMaximize?.(card);
+    });
     this.render(body, exhibit);
 
     card.append(header, body);
@@ -56,6 +71,11 @@ export class Exhibits {
     }
   }
 
+  // Public resolver for the lightbox (focus items name an exhibit by ref).
+  resolveCard(turnId: string, ref: string): HTMLElement | undefined {
+    return this.find(turnId, ref);
+  }
+
   private find(turnId: string, ref: string): HTMLElement | undefined {
     return (
       this.byKey.get(`${turnId}:${ref}`) ??
@@ -65,6 +85,9 @@ export class Exhibits {
   }
 
   private sweep(card: HTMLElement): void {
+    // If this card is focused in the lightbox, get it back into the grid first
+    // so it sweeps out where it lives, not inside the overlay.
+    this.onEvict?.(card);
     card.classList.add("dismissing");
     card.addEventListener("animationend", () => card.remove(), { once: true });
   }

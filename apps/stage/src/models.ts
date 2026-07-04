@@ -20,7 +20,7 @@ export const THINKING_OPTIONS: Option[] = [
   { value: "low", label: "Low" },
   { value: "medium", label: "Medium" },
   { value: "high", label: "High" },
-  { value: "xhigh", label: "Extra high" },
+  { value: "xhigh", label: "XHigh" },
   { value: "max", label: "Max" },
 ];
 

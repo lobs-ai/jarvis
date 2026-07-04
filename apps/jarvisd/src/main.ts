@@ -6,13 +6,14 @@ import { fileURLToPath } from "node:url";
 import Anthropic from "@anthropic-ai/sdk";
 import { WhisperStt, ChatterboxTts } from "@jarvis/voice";
 import { SettingsPatch, type SettingsSnapshot } from "@jarvis/protocol";
-import { loadConfig, saveConfig } from "./config.js";
+import { loadConfig, saveConfig, JARVIS_HOME } from "./config.js";
 import { MemoryStore } from "./memory/store.js";
 import { Session } from "./session.js";
 import { StageSocket } from "./ws.js";
 import { McpManager, riskOf, type McpServerSpec } from "./mcp/manager.js";
 import { ConfirmBroker } from "./mcp/confirm.js";
-import { BackgroundRunner } from "./brain/tasks.js";
+import { BackgroundRunner, type BackgroundReport } from "./brain/tasks.js";
+import { CliBackground } from "./brain/bg-cli.js";
 import type { ToolDef } from "./brain/loop.js";
 import type { BrainPort } from "./brain/port.js";
 import { ApiBrain } from "./brain/api-brain.js";
@@ -34,6 +35,7 @@ const CLI_ALLOWED = [
   "WebFetch",
   "mcp__wiki__wiki_search",
   "mcp__wiki__wiki_read",
+  "mcp__wiki__wiki_list",
   "mcp__wiki__wiki_propose_edit",
   "mcp__browser__browser_open",
   "mcp__browser__browser_read",
@@ -41,6 +43,8 @@ const CLI_ALLOWED = [
   // control endpoint, so the stage sees every change immediately)
   "mcp__settings__settings_get",
   "mcp__settings__settings_set",
+  // hand long work to the tier-2 worker (routes through jarvisd's /tasks)
+  "mcp__tasks__dispatch_background",
 ];
 const CLI_DISALLOWED = [
   // file editing stays out — Jarvis is not a coding agent; the wiki gate would
@@ -110,6 +114,12 @@ async function main(): Promise<void> {
   const cliServers: McpServerSpec[] = [
     ...servers,
     { name: "speech", command: TSX, args: [join(REPO_ROOT, "servers/speech/src/index.ts")] },
+    {
+      name: "tasks",
+      command: TSX,
+      args: [join(REPO_ROOT, "servers/tasks/src/index.ts")],
+      env: { JARVIS_PORT: String(cfg.port) },
+    },
   ];
 
   // Brain selection: prefer Rafe's Claude Code subscription (CliBrain); fall
@@ -162,26 +172,64 @@ async function main(): Promise<void> {
     console.log("brain: Anthropic API (SDK)");
   }
 
+  brain.warm?.(); // spawn the CLI child now — MCP servers connect before turn #1
+
   const session = new Session(brain, sock, store, null, null);
   sock.bind(session);
   session.attachMcp(mcp, confirm);
 
+  // ── Tier-2 background pipeline (both brain paths) ──────────────
+  // Reports announce when the room goes idle; staged wiki edits then walk
+  // through the same confirm→gated-commit flow as tier-1 proposals, one diff
+  // at a time. Proposals persist on disk (~/.jarvis/proposals), so a worker
+  // that already exited can still be committed from jarvisd's wiki server.
+  const reviewProposals = async (proposals: string[]): Promise<void> => {
+    for (const id of proposals) {
+      let detail = `(proposal ${id})`;
+      try {
+        const raw = JSON.parse(
+          readFileSync(join(JARVIS_HOME, "proposals", `${id}.json`), "utf8"),
+        ) as { path?: string; diff?: string };
+        detail = `${raw.path ?? ""}\n\n${raw.diff ?? ""}`.trim().slice(0, 4000);
+      } catch {
+        /* fall back to the bare id — the report described it */
+      }
+      await session.waitForActiveDrain();
+      const ok = await confirm.request(`Commit background wiki edit? (proposal ${id})`, detail);
+      if (!ok) continue;
+      const res = await mcp.execute("wiki_commit", { proposal_id: id });
+      session.announceWhenIdle("Committed a background wiki edit.", res);
+    }
+  };
+  const onBackgroundDone = (report: BackgroundReport): void => {
+    const summary =
+      report.report.length > 400 ? report.report.slice(0, 400) + "…" : report.report;
+    const proposalNote = report.proposals.length
+      ? ` I staged ${report.proposals.length} wiki edit(s) for you to review.`
+      : "";
+    session.announceWhenIdle(`Finished "${report.task.slice(0, 60)}".${proposalNote}`, summary);
+    if (report.proposals.length) void reviewProposals(report.proposals);
+  };
+  let dispatchBackground: ((task: string) => string) | null = null;
+
   // ── Settings control plane ─────────────────────────────────────
   // jarvisd is the single writer: the stage panel (WS), the settings MCP
-  // server (HTTP), and curl all land in applySettings. Wiki moves apply live
-  // (the wiki server re-reads config per call); model/thinking are baked into
-  // the CLI child, so they restart the conversation — deferred to turn end
-  // when Jarvis changes them on itself mid-turn.
+  // server (HTTP), and curl all land in applySettings. The wiki server reads
+  // config per call, but wiki_dir / model / thinking are all baked into the
+  // CLI child (the prompt embeds a wiki snapshot), so any of them restarts
+  // the conversation — deferred to turn end when changed mid-turn.
   const currentSettings = (): SettingsSnapshot => ({
     wiki_dir: cfg.wiki_dir,
     model_tier1: cfg.model_tier1,
     model_tier2: cfg.model_tier2,
     thinking: cfg.thinking,
+    thinking_tier2: cfg.thinking_tier2,
   });
 
   let brainRestartPending = false;
   const restartBrain = (): void => {
     brain.reset?.();
+    brain.warm?.(); // respawn immediately so the next turn doesn't race MCP startup
     sock.sendSessionReset();
   };
   session.onIdle = () => {
@@ -194,27 +242,38 @@ async function main(): Promise<void> {
     const patch = SettingsPatch.parse(raw);
     saveConfig(patch);
     const notes: string[] = [];
+    let brainChanged = false;
     if (patch.wiki_dir && patch.wiki_dir !== cfg.wiki_dir) {
       cfg.wiki_dir = patch.wiki_dir;
       notes.push(`wiki → ${patch.wiki_dir}`);
+      brainChanged = true; // the prompt's baked wiki snapshot must re-bake
     }
     if (patch.model_tier2 && patch.model_tier2 !== cfg.model_tier2) {
       cfg.model_tier2 = patch.model_tier2;
       notes.push(`tier-2 → ${patch.model_tier2}`);
     }
-    const brainChanged =
+    // tier-2 knobs apply live: every background task is a fresh child
+    if (patch.thinking_tier2 && patch.thinking_tier2 !== cfg.thinking_tier2) {
+      cfg.thinking_tier2 = patch.thinking_tier2;
+      notes.push(`tier-2 thinking → ${patch.thinking_tier2}`);
+    }
+    if (
       (patch.model_tier1 && patch.model_tier1 !== cfg.model_tier1) ||
-      (patch.thinking && patch.thinking !== cfg.thinking);
-    if (brainChanged) {
+      (patch.thinking && patch.thinking !== cfg.thinking)
+    ) {
       if (patch.model_tier1) cfg.model_tier1 = patch.model_tier1;
       if (patch.thinking) cfg.thinking = patch.thinking;
       brain.configure?.({ model: cfg.model_tier1, thinking: cfg.thinking });
+      notes.push(`${cfg.model_tier1}, thinking ${cfg.thinking}`);
+      brainChanged = true;
+    }
+    if (brainChanged) {
       if (session.isActive()) {
         brainRestartPending = true;
-        notes.push(`${cfg.model_tier1}, thinking ${cfg.thinking} — fresh conversation when this turn ends`);
+        notes.push("fresh conversation when this turn ends");
       } else {
         restartBrain();
-        notes.push(`${cfg.model_tier1}, thinking ${cfg.thinking} — fresh conversation`);
+        notes.push("fresh conversation");
       }
     }
     const result = { settings: currentSettings(), note: notes.join(" · ") || undefined };
@@ -233,6 +292,7 @@ async function main(): Promise<void> {
   };
   sock.onSessionNew = () => {
     session.resetConversation();
+    brain.warm?.();
     brainRestartPending = false; // the reset already delivered any pending change
     sock.sendSessionReset();
   };
@@ -261,15 +321,9 @@ async function main(): Promise<void> {
   // model's tools + tier-2 + built-ins.
   if (client) {
     // ── Anthropic SDK path: jarvisd owns tool execution ──────────────
-    const bg = new BackgroundRunner(client, cfg.model_tier2, servers, (report) => {
-      const summary =
-        report.report.length > 400 ? report.report.slice(0, 400) + "…" : report.report;
-      const proposalNote = report.proposals.length
-        ? ` I staged ${report.proposals.length} wiki edit(s) for you to review.`
-        : "";
-      session.announceWhenIdle(`Finished "${report.task.slice(0, 60)}".${proposalNote}`, summary);
-    });
-    session.setBackgroundDispatch((task) => bg.dispatch(task));
+    const bg = new BackgroundRunner(client, cfg.model_tier2, servers, onBackgroundDone);
+    dispatchBackground = (task) => bg.dispatch(task);
+    session.setBackgroundDispatch(dispatchBackground);
 
     const BUILTIN_TOOLS: ToolDef[] = [
       {
@@ -319,9 +373,17 @@ async function main(): Promise<void> {
     refreshTools();
   } else {
     // ── Subscription path: Claude Code calls MCP directly; jarvisd's own
-    // connections are only for bundle context + the gated commit. Tier-2
-    // dispatch and model-written facts are API-path features for now.
+    // connections are only for bundle context + the gated commit. Tier-2 is
+    // a detached one-shot claude run per task (opus + xhigh — deliberation is
+    // free off the voice path), dispatched via the tasks MCP server → /tasks.
     void mcp.connectAll(servers);
+    const bgCli = new CliBackground({
+      model: () => cfg.model_tier2,
+      thinking: () => cfg.thinking_tier2,
+      servers: cliServers.filter((s) => s.name === "wiki"),
+      onDone: onBackgroundDone,
+    });
+    dispatchBackground = (task) => bgCli.dispatch(task);
   }
 
   const server = createServer((req, res) => {
@@ -357,6 +419,29 @@ async function main(): Promise<void> {
       }
       res.writeHead(405);
       res.end("GET or POST");
+      return;
+    }
+    // Background dispatch (localhost-only): the tasks MCP server rides this,
+    // so tier-1's dispatch_background lands on jarvisd's own worker.
+    if (url === "/tasks" && req.method === "POST") {
+      let body = "";
+      req.on("data", (c: Buffer) => (body += c.toString()));
+      req.on("end", () => {
+        try {
+          const task = String((JSON.parse(body || "{}") as { task?: unknown }).task ?? "").trim();
+          if (!task) throw new Error("missing task");
+          if (!dispatchBackground) throw new Error("no background worker available");
+          const id = dispatchBackground(task);
+          res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+          res.end(
+            `dispatched as ${id} (${cfg.model_tier2}, thinking ${cfg.thinking_tier2}) — ` +
+              `the report will arrive in the conversation when it finishes; tell Rafe it's running.`,
+          );
+        } catch (err) {
+          res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+          res.end(String(err));
+        }
+      });
       return;
     }
     // Health for the stage's status strip: live sidecar probes, cheap enough
@@ -410,9 +495,25 @@ async function main(): Promise<void> {
       );
       return;
     }
-    // Exhibit ref resolver: <show ref="wiki:PATH"/> → the stage fetches here.
+    // Exhibit ref resolver: <show ref="wiki:PATH"/> / <show ref="file:PATH"/> →
+    // the stage fetches here.
     if (url === "/ref") {
       const uri = new URL(req.url ?? "", "http://x").searchParams.get("uri") ?? "";
+      // file: a repo-relative path (Jarvis's own source/docs), sandboxed to the
+      // repo root. The wiki lives elsewhere and stays behind wiki: — a file: ref
+      // can never climb into it (or anywhere outside the repo).
+      const fileMatch = uri.match(/^file:(.+)$/);
+      if (fileMatch) {
+        const path = normalize(join(REPO_ROOT, fileMatch[1]!));
+        if (!path.startsWith(REPO_ROOT) || !existsSync(path)) {
+          res.writeHead(404);
+          res.end(`no such repo file: ${fileMatch[1]!}`);
+          return;
+        }
+        res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+        res.end(readFileSync(path));
+        return;
+      }
       const m = uri.match(/^wiki:(.+)$/);
       if (!m) {
         res.writeHead(404);
@@ -427,8 +528,11 @@ async function main(): Promise<void> {
             res.end(text.slice(0, 500));
             return;
           }
-          // strip the "# path (base-hash …)" header wiki_read prepends
-          const body = text.replace(/^# \S+ \(base-hash \w+\)\n\n/, "");
+          // strip the "# path (base-hash …)" header wiki_read prepends (paths
+          // may contain spaces) and YAML frontmatter — neither is content
+          const body = text
+            .replace(/^# .+? \(base-hash \w+\)\n\n/, "")
+            .replace(/^---\n[\s\S]*?\n---\n+/, "");
           res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
           res.end(body);
         })

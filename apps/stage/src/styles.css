@@ -285,7 +285,9 @@ kbd {
   transition: color 0.15s;
 }
 .exhibit header .close:hover { color: var(--err); }
-.exhibit .body { padding: 16px 18px; overflow-x: auto; }
+/* the body is clickable to maximize into the lightbox */
+.exhibit .body { padding: 16px 18px; overflow-x: auto; cursor: zoom-in; }
+.exhibit.in-lightbox .body { cursor: inherit; }
 .exhibit .body h1, .exhibit .body h2, .exhibit .body h3 { margin: 0.4em 0; color: #eaf2ff; }
 .exhibit .body p, .exhibit .body li { line-height: 1.5; margin: 0.35em 0; }
 .exhibit .body table { border-collapse: collapse; margin: 0.4em 0; }
@@ -733,3 +735,105 @@ kbd {
 }
 .confirm-card button.approve { border-color: rgba(55, 211, 194, 0.5); color: var(--teal); }
 .confirm-card button.deny { border-color: rgba(255, 107, 107, 0.4); color: var(--err); }
+
+/* ── exhibit lightbox ───────────────────── */
+.lightbox {
+  position: absolute;
+  inset: 0;
+  z-index: 55;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3vh 3vw;
+  background: rgba(3, 6, 12, 0.82);
+  backdrop-filter: blur(6px);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.2s, visibility 0.2s;
+}
+.lightbox.open { opacity: 1; visibility: visible; }
+.lb-panel {
+  width: 94vw;
+  height: 94vh;
+  max-width: 1400px;
+  display: flex;
+  flex-direction: column;
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
+  border: 1px solid rgba(90, 167, 255, 0.2);
+  border-radius: var(--radius);
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6), 0 0 40px rgba(55, 211, 194, 0.06);
+  overflow: hidden;
+}
+.lb-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  flex: none;
+}
+.lb-title {
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lb-tools { display: flex; align-items: center; gap: 6px; flex: none; }
+.lb-btn {
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--ink-dim);
+  background: rgba(16, 26, 46, 0.6);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 4px 10px;
+  min-width: 30px;
+  transition: color 0.15s, border-color 0.15s;
+}
+.lb-btn:hover { color: #fff; border-color: rgba(55, 211, 194, 0.5); }
+.lb-close { color: var(--ink); }
+.lb-zoom {
+  min-width: 44px;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--ink-dim);
+  font-variant-numeric: tabular-nums;
+}
+.lb-viewport {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+.lb-viewport.grabbing { cursor: grabbing; }
+.lb-content {
+  transform-origin: center center;
+  transition: transform 90ms ease-out;
+  will-change: transform;
+}
+.lb-viewport.grabbing .lb-content { transition: none; }
+
+/* a maximized card sheds its chrome and grows; its body renders live (updates
+   keep flowing while focused) */
+.exhibit.in-lightbox {
+  animation: none;
+  margin: 0;
+  max-width: none;
+  width: min(1100px, 86vw);
+  border-color: rgba(90, 167, 255, 0.18);
+  box-shadow: none;
+}
+.exhibit.in-lightbox > header { display: none; }
+.exhibit.in-lightbox .body { overflow: visible; }
+.exhibit.in-lightbox .body img { max-width: 100%; display: block; }
+.exhibit-placeholder { display: none; }

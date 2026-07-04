@@ -18,7 +18,7 @@ const server = new McpServer({ name: "jarvis-settings", version: "0.1.0" });
 
 server.tool(
   "settings_get",
-  "Read Jarvis's current settings: wiki_dir, model_tier1, model_tier2, thinking.",
+  "Read Jarvis's current settings: wiki_dir, model_tier1, model_tier2, thinking, thinking_tier2.",
   {},
   async () => {
     try {
@@ -38,11 +38,15 @@ server.tool(
   {
     wiki_dir: z.string().optional().describe("absolute path to the wiki's markdown root"),
     model_tier1: z.string().optional().describe("conversation model, e.g. claude-opus-4-8, claude-sonnet-5"),
-    model_tier2: z.string().optional().describe("background-task model"),
+    model_tier2: z.string().optional().describe("background-worker model (applies live; each task is a fresh run)"),
     thinking: z
       .enum(["off", "low", "medium", "high", "xhigh", "max"])
       .optional()
       .describe("thinking effort (off disables extended thinking; the rest are CLI --effort levels)"),
+    thinking_tier2: z
+      .enum(["off", "low", "medium", "high", "xhigh", "max"])
+      .optional()
+      .describe("background-worker thinking effort (applies live)"),
   },
   async (patch) => {
     try {

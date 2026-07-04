@@ -235,6 +235,7 @@ export class Session {
         parts.push(serializeShow(item));
       else if (item.kind === "update") parts.push(`<update ref="${item.ref}">…</update>`);
       else if (item.kind === "dismiss") parts.push(`<dismiss ref="${item.ref}"/>`);
+      else if (item.kind === "focus") parts.push(`<focus ref="${item.ref}"/>`);
     }
     const performedText = parts.join(" ").trim();
     this.brain.recordInterrupted(performedText);

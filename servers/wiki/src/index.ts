@@ -36,7 +36,44 @@ interface Proposal {
   diff: string;
   message: string;
 }
-const proposals = new Map<string, Proposal>();
+
+// Proposals live on DISK, not in memory: the proposer and the committer are
+// different wiki-server processes (tier-1's CLI child stages, jarvisd commits
+// after Rafe's yes; a tier-2 one-shot exits before review even starts). An
+// in-memory map here once meant every gated commit hit "unknown proposal".
+const PROPOSALS_DIR = join(homedir(), ".jarvis", "proposals");
+const PROPOSAL_TTL_MS = 24 * 60 * 60 * 1000;
+
+function proposalFile(id: string): string {
+  if (!/^[a-z0-9-]+$/i.test(id)) throw new Error(`bad proposal id: ${id}`);
+  return join(PROPOSALS_DIR, `${id}.json`);
+}
+
+function saveProposal(id: string, prop: Proposal): void {
+  mkdirSync(PROPOSALS_DIR, { recursive: true, mode: 0o700 });
+  writeFileSync(proposalFile(id), JSON.stringify(prop));
+}
+
+function loadProposal(id: string): Proposal | null {
+  try {
+    const file = proposalFile(id);
+    if (Date.now() - statSync(file).mtimeMs > PROPOSAL_TTL_MS) {
+      rmSync(file, { force: true });
+      return null;
+    }
+    return JSON.parse(readFileSync(file, "utf8")) as Proposal;
+  } catch {
+    return null;
+  }
+}
+
+function deleteProposal(id: string): void {
+  try {
+    rmSync(proposalFile(id), { force: true });
+  } catch {
+    /* already gone */
+  }
+}
 
 function abs(relPath: string): string {
   const root = wikiDir();
@@ -197,7 +234,7 @@ server.tool(
     const oldContent = existsSync(file) ? readFileSync(file, "utf8") : "";
     const proposalId = randomUUID().slice(0, 8);
     const diff = unifiedDiff(p, oldContent, content);
-    proposals.set(proposalId, {
+    saveProposal(proposalId, {
       path: p,
       baseHash: oldContent ? hashOf(oldContent) : "",
       newContent: content,
@@ -224,7 +261,7 @@ server.tool(
   "Commit a previously proposed edit. MUTATE-CLASS: only after Rafe's explicit confirmation. Revalidates the base hash; if the page moved meanwhile, refuses and returns a rebased proposal instead.",
   { proposal_id: z.string() },
   async ({ proposal_id }) => {
-    const prop = proposals.get(proposal_id);
+    const prop = loadProposal(proposal_id);
     if (!prop) {
       return { content: [{ type: "text", text: `unknown or expired proposal: ${proposal_id}` }], isError: true };
     }
@@ -233,10 +270,10 @@ server.tool(
     const currentHash = current ? hashOf(current) : "";
     if (currentHash !== prop.baseHash) {
       // the page moved under us — re-propose against the new base, never clobber
-      proposals.delete(proposal_id);
+      deleteProposal(proposal_id);
       const newId = randomUUID().slice(0, 8);
       const diff = unifiedDiff(prop.path, current, prop.newContent);
-      proposals.set(newId, { ...prop, baseHash: currentHash, diff });
+      saveProposal(newId, { ...prop, baseHash: currentHash, diff });
       return {
         content: [
           {
@@ -252,7 +289,7 @@ server.tool(
     // cwd works from a repo subdir too — git resolves the repo root upward
     execFileSync("git", ["add", prop.path], { cwd: wikiDir() });
     execFileSync("git", ["commit", "-m", prop.message], { cwd: wikiDir() });
-    proposals.delete(proposal_id);
+    deleteProposal(proposal_id);
     const dangling = lintLinks(prop.newContent);
     const lintNote = dangling.length ? ` (dangling links: ${dangling.join(", ")})` : "";
     return { content: [{ type: "text", text: `committed ${prop.path}: "${prop.message}"${lintNote}` }] };

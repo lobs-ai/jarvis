@@ -13,6 +13,7 @@ export const SettingsPatch = z.object({
   model_tier1: z.string().min(1).optional(),
   model_tier2: z.string().min(1).optional(),
   thinking: ThinkingLevel.optional(),
+  thinking_tier2: ThinkingLevel.optional(),
 });
 export type SettingsPatch = z.infer<typeof SettingsPatch>;
 
@@ -21,6 +22,7 @@ export const SettingsSnapshot = z.object({
   model_tier1: z.string(),
   model_tier2: z.string(),
   thinking: ThinkingLevel,
+  thinking_tier2: ThinkingLevel,
 });
 export type SettingsSnapshot = z.infer<typeof SettingsSnapshot>;
 

@@ -12,6 +12,7 @@ import { Settings } from "./ui/settings.js";
 import { Tabs } from "./ui/tabs.js";
 import { Wiki } from "./ui/wiki.js";
 import { StatusStrip, type Health } from "./ui/statusstrip.js";
+import { Lightbox } from "./ui/lightbox.js";
 import { reloadIfStale } from "./reload.js";
 
 // ── elements ─────────────────────────────────────────────────
@@ -31,7 +32,12 @@ const clearExhibits = $<HTMLButtonElement>("#clearExhibits");
 // ── UI modules ───────────────────────────────────────────────
 const transcript = new Transcript($("#transcript"), $("#conversationPane"));
 const toasts = new Toasts($("#toasts"));
-const exhibits = new Exhibits(exhibitsEl);
+const lightbox = new Lightbox();
+const exhibits = new Exhibits(
+  exhibitsEl,
+  (card) => lightbox.open(card), // click a card → maximize
+  (card) => lightbox.closeIfShowing(card), // card evicted/swept → drop the lightbox
+);
 const statusStrip = new StatusStrip();
 
 const wiki = new Wiki((path, title) => {
@@ -159,7 +165,7 @@ async function toggleMic(): Promise<void> {
     mic.begin();
   } else {
     micOn = false;
-    mic.end();
+    mic.disarm();
     if (endpointer.cancel()) wire.send({ type: "mic.cancel" });
     utteranceActive = false;
     renderState();
@@ -181,6 +187,7 @@ function clearRoom(): void {
   thoughtLines.clear();
   currentJarvisLine = null;
   currentTurnId = null;
+  lightbox.closeIfAny();
   exhibits.dismiss("", "all");
   transcript.addLine("sys", "— new conversation —");
 }
@@ -215,7 +222,9 @@ function isTyping(): boolean {
 
 document.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape") {
-    if (settings.isOpen) settings.close();
+    // priority: lightbox > settings drawer > interrupt the performance
+    if (lightbox.isOpen) lightbox.close();
+    else if (settings.isOpen) settings.close();
     else interruptPerformance();
     return;
   }
@@ -309,6 +318,13 @@ const wire = new Wire({
         if (item.kind === "update") return exhibits.update(item.turnId, item.ref, item.body);
         if (item.kind === "dismiss") return exhibits.dismiss(item.turnId, item.ref);
         if (item.kind === "act") return activity.tool(item.tool, item.risk);
+        if (item.kind === "focus") {
+          // Jarvis maximizes/zooms an exhibit; "none" closes. Unknown ref → ignore.
+          if (item.ref === "none") return lightbox.closeIfAny();
+          const card = exhibits.resolveCard(item.turnId, item.ref);
+          if (card) lightbox.open(card, item.zoom);
+          return;
+        }
         return;
       }
       case "audio.segment":

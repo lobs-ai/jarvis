@@ -10,7 +10,7 @@ import { McpManager as Manager } from "../mcp/manager.js";
 // task finds no actuator and no unreviewed write path (design §Security).
 const TIER2_ALLOWED = /^(wiki_(search|read|propose_edit)|browser_read|facts_)/;
 
-const TIER2_SYSTEM = `You are Jarvis's background worker. Complete the task using your tools, \
+export const TIER2_SYSTEM = `You are Jarvis's background worker. Complete the task using your tools, \
 then reply with a concise plain-text report of what you did and found. You may stage wiki \
 edits with wiki_propose_edit — Rafe will review the diffs as a batch; you cannot commit. \
 No stage markup; this output is a report, not a performance.`;

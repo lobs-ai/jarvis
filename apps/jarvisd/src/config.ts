@@ -13,6 +13,9 @@ const ConfigSchema = z.object({
   // extended-thinking effort for tier-1: the CLI's --effort levels, plus our
   // "off" (MAX_THINKING_TOKENS=0 — measured 9s→2s ttft on opus)
   thinking: z.enum(["off", "low", "medium", "high", "xhigh", "max"]).default("off"),
+  // tier-2 has no voice-latency budget — deliberation is free there (Rafe's
+  // call: opus + xhigh). Applies live; each background task is a fresh child.
+  thinking_tier2: z.enum(["off", "low", "medium", "high", "xhigh", "max"]).default("xhigh"),
   stt_url: z.string().default("http://127.0.0.1:7423"),
   tts_url: z.string().default("http://127.0.0.1:7422"),
   tts_voice: z.string().default("default"),

@@ -27,3 +27,19 @@ export async function reloadIfStale(): Promise<void> {
   sessionStorage.setItem(KEY, server);
   location.reload();
 }
+
+// Self-heal for a failed lazy chunk (mermaid diagram renderers are dynamic
+// imports): if a rebuild removed the chunk this bundle wants, reload onto the
+// current bundle instead of showing a dead diagram. Keyed to the running
+// bundle: one reload attempt per bundle, so a tab that lives across several
+// rebuilds can heal each time without ever looping.
+export function reloadOnChunkFailure(err: unknown): boolean {
+  if (!/dynamically imported module|Importing a module script failed/i.test(String(err))) {
+    return false;
+  }
+  const key = `stage:chunk-reload:${import.meta.url}`;
+  if (sessionStorage.getItem(key)) return false; // already tried for this bundle
+  sessionStorage.setItem(key, "1");
+  location.reload();
+  return true;
+}

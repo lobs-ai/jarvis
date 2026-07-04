@@ -377,6 +377,17 @@ a few seconds of quiet) — the idle-scheduling pattern ported from
 `lobs-core/src/services/voice/realtime-session.ts`, which already solved exactly this. No
 subagent forest in v0.
 
+**Tier-2 on the subscription path (built 2026-07-03, Rafe's spec: opus + xhigh).** On the
+CLI path the background worker is a detached **one-shot `claude -p` run per task** — no warm
+child, because nobody waits on its first token. `CliBackground` (jarvisd) spawns it with
+`model_tier2` / `--effort thinking_tier2` (defaults `claude-opus-4-8` / `xhigh`; both apply
+live since every task is a fresh process) and only the wiki MCP server + web tools —
+the same reduced no-actuator toolset as the API-path runner. Dispatch rides the same
+pattern as settings: a thin `tasks` MCP server exposes `dispatch_background`, which POSTs
+to jarvisd's `/tasks`; jarvisd owns the worker either way, so both brain paths share one
+report pipeline (`announceWhenIdle` + per-diff confirm→gated-commit review of staged
+proposals). 15-minute timeout per task.
+
 ### The wiki (Karpathy wiki)
 
 A separate repo (`~/wiki`): plain markdown about **Rafe**, not about Jarvis — `projects/`,
@@ -393,7 +404,17 @@ and, on mismatch (a tier-2 task committed meanwhile, or Rafe edited `~/wiki` in 
 — it's plain git, that's the point), refuses and re-proposes a rebased diff instead of
 clobbering — and says so ("the page moved under us; here's the updated diff"), because Rafe
 already said yes once and an unexplained second ask reads as a bug. The wiki server is the
-single writer for all Jarvis-originated edits, serializing tier-1 and tier-2. Confirmation is
+single writer for all Jarvis-originated edits, serializing tier-1 and tier-2. Proposals
+persist on **disk** (`~/.jarvis/proposals/<id>.json`, 24h TTL), not in server memory: the
+proposer and the committer are different wiki-server *processes* (the CLI child stages,
+jarvisd commits after Rafe's yes; a tier-2 one-shot has already exited by review time), and
+an in-memory map meant every cross-process commit died with "unknown proposal".
+
+The wiki is also baked into the brain's **system prompt** at child spawn (2026-07-03): the
+wiki's own `index.md` catalog plus the full page-path list (`snapshotWiki`), so "what do I
+know about X" needs no discovery round-trip — this is what makes wiki answers feel
+instant. The snapshot refreshes on any conversation restart, and a `wiki_dir` settings
+change now restarts the conversation for exactly that reason. Confirmation is
 deliberately conservative for a permanent record gated on a lossy channel — and it does *not*
 lean on STT confidence, because the whisper-server endpoint returns bare text with no
 confidence signal: a spoken confirmation counts only if the transcript exactly matches a small
@@ -700,7 +721,15 @@ it is where the project's central mitigation (choreography discipline) actually 
 <show id="ID" type="code" lang="LANG" title="...">inline payload</show>  by value
 <update ref="ID">replacement or patch payload</update>
 <dismiss ref="ID"/>    <dismiss ref="all"/>
+<focus ref="ID" zoom="2"/>    <focus ref="none"/>
 ```
+
+**focus (2026-07-03).** Maximizes one exhibit into a full-stage lightbox, optionally at a
+magnification — the model's tool for "look at this part" walkthroughs of diagrams and images.
+Dual control by design: Rafe has the same affordance by hand (⛶ on every card, wheel zoom,
+drag pan, Esc) and his input always wins — the model never snaps the view back. `ref="none"`
+restores the stage. This is also a deliberate rehearsal for the window-control end state:
+focus/zoom on a stage card maps 1:1 to raise/resize on a real window later.
 
 `id`s are model-minted, unique within the turn (stage namespaces by turn). `ref=` schemes:
 `wiki:` (page path), `img:` (content hash via jarvisd), `tool:` (a prior tool-result handle).

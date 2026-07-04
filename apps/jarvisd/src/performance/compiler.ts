@@ -8,9 +8,9 @@ import { Exhibit, type PerformanceItem } from "@jarvis/protocol";
 // if one lands mid-sentence we flush the partial prose first so choreography
 // order is preserved at some prosody cost.
 
-const TAG_OPEN = /<(show|update|dismiss)\b/;
+const TAG_OPEN = /<(show|update|dismiss|focus)\b/;
 // Trailing text that could be the start of a tag on the next delta — hold it back.
-const PARTIAL_TAG_TAIL = /<(?:s(?:h(?:ow?)?)?|u(?:p(?:d(?:a(?:te?)?)?)?)?|d(?:i(?:s(?:m(?:i(?:ss?)?)?)?)?)?)?$/;
+const PARTIAL_TAG_TAIL = /<(?:s(?:h(?:ow?)?)?|u(?:p(?:d(?:a(?:te?)?)?)?)?|d(?:i(?:s(?:m(?:i(?:ss?)?)?)?)?)?|f(?:o(?:c(?:us?)?)?)?)?$/;
 
 const ABBREVIATIONS = /\b(e\.g|i\.e|etc|vs|dr|mr|mrs|ms|st|no|v[0-9]*)\.$/i;
 
@@ -130,7 +130,7 @@ export class PerformanceCompiler {
       this.buffer = this.buffer.slice(openEnd + 1);
       return true;
     }
-    const name = nameMatch[1] as "show" | "update" | "dismiss";
+    const name = nameMatch[1] as "show" | "update" | "dismiss" | "focus";
     const selfClosing = /\/>\s*$/.test(openTag);
 
     let payload = "";
@@ -150,13 +150,28 @@ export class PerformanceCompiler {
   }
 
   private emitDirective(
-    name: "show" | "update" | "dismiss",
+    name: "show" | "update" | "dismiss" | "focus",
     attrs: Record<string, string>,
     payload: string,
   ): void {
     if (name === "dismiss") {
       if (!attrs.ref) return this.warn("dismiss without ref");
       this.events.onItem({ kind: "dismiss", seq: this.seq++, turnId: this.turnId, ref: attrs.ref });
+      return;
+    }
+    if (name === "focus") {
+      if (!attrs.ref) return this.warn("focus without ref");
+      const zoom = attrs.zoom !== undefined ? Number(attrs.zoom) : undefined;
+      if (zoom !== undefined && (!Number.isFinite(zoom) || zoom <= 0 || zoom > 8)) {
+        return this.warn(`focus with invalid zoom "${attrs.zoom}"`);
+      }
+      this.events.onItem({
+        kind: "focus",
+        seq: this.seq++,
+        turnId: this.turnId,
+        ref: attrs.ref,
+        ...(zoom !== undefined ? { zoom } : {}),
+      });
       return;
     }
     if (name === "update") {
