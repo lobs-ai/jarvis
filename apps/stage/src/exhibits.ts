@@ -78,9 +78,13 @@ export class Exhibits {
     if (card) {
       this.byKey.delete(card.dataset.key!);
       this.sweep(card);
-    } else {
-      this.onFault?.("missing-target", `<dismiss ref="${ref}"/> matched no exhibit on the stage`, turnId);
     }
+    // A dismiss that matches nothing already has its intended end-state (that
+    // exhibit gone), so there is nothing to repair — and faulting here is
+    // actively misleading: it reads to the brain as "it was there and is now
+    // swept," masking the real failure (the show never rendered), which is
+    // reported at show time instead. update/focus misses still fault; those are
+    // repairable (re-show, then modify).
   }
 
   // Public resolver for the lightbox (focus items name an exhibit by ref).

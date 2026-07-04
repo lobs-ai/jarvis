@@ -194,6 +194,10 @@ export class StageSocket implements SessionSink {
     this.broadcast({ type: "state", orb });
   }
 
+  sendBarge(verdict: "cut" | "resume"): void {
+    this.broadcast({ type: "barge", verdict });
+  }
+
   sendTurnBegin(turnId: string, source: "voice" | "text"): void {
     this.ackedThisTurn.clear(); // new turn: seqs restart, so drop last turn's ack keys
     this.broadcast({ type: "turn.begin", turnId, source });

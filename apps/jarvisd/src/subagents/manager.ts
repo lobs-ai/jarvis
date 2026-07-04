@@ -236,6 +236,17 @@ export class SubagentManager {
     );
   }
 
+  // Is a subagent with this label actively generating (starting/working)?
+  // Ambient drafts key off this so they never stack: two background Opus
+  // children generating at once share the subscription and blow up the
+  // foreground voice turn's first-token latency (observed: 3s → 20s+).
+  hasWorkingLabel(label: string): boolean {
+    const want = sanitizeLabel(label);
+    return [...this.pool.values()].some(
+      (s) => s.label === want && (s.state === "working" || s.state === "starting"),
+    );
+  }
+
   dispose(): void {
     clearInterval(this.reaper);
     for (const sub of this.pool.values()) {

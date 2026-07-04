@@ -32,6 +32,10 @@ export interface BrainPort {
   turn(userText: string, cb: BrainCallbacks, signal: AbortSignal): Promise<{
     fullText: string;
     aborted: boolean;
+    // non-success backend result (e.g. the CLI's error_during_execution): the
+    // turn ended in error with no/partial speech — Session surfaces it instead
+    // of ending the turn silently.
+    error?: string;
   }>;
   // Barge-in: record that the just-aborted turn only performed `performedText`,
   // so the model's memory matches what Rafe actually heard.

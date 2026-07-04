@@ -25,6 +25,9 @@ export interface SessionSink {
   sendAudio(turnId: string, seq: number, pcm: Uint8Array): void;
   sendWarning(message: string): void;
   sendState(orb: "idle" | "listening" | "thinking" | "speaking" | "acting" | "degraded"): void;
+  // acoustic barge verdict: "cut" drops the client's buffered TTS (a real
+  // interrupt landed), "resume" un-ducks it (the barge was noise, keep talking).
+  sendBarge(verdict: "cut" | "resume"): void;
   sendTurnBegin(turnId: string, source: "voice" | "text" | "system"): void;
   sendTurnEnd(turnId: string): void;
   sendHeard(turnId: string, text: string): void;
@@ -389,6 +392,8 @@ export class Session {
     const rms = pcm16Rms(pcm);
     if (rms < RMS_SPEECH_FLOOR) {
       console.log(`[stt] dropped silent utterance (rms ${rms.toFixed(4)}, ${(total / 32000).toFixed(1)}s)`);
+      // A barge that turned out to be silence never interrupts — resume Jarvis.
+      if (this.active) this.sink.sendBarge("resume");
       this.sink.sendState(this.active ? "speaking" : "idle");
       return;
     }
@@ -406,6 +411,14 @@ export class Session {
       return;
     }
     if (!transcript) {
+      if (this.active) {
+        // Barge that carried no real words (leaked TTS, a cough, room noise):
+        // never interrupt Jarvis for it, and don't nag "didn't catch that" over
+        // his own speech — just resume the ducked performance.
+        this.sink.sendBarge("resume");
+        this.sink.sendState("speaking");
+        return;
+      }
       // design: Failure UX — empty STT gets a spoken shape via a canned local turn
       this.warn("didn't catch that");
       this.sink.sendState("idle");
@@ -416,7 +429,9 @@ export class Session {
     // needs no wake word), and only a fresh turn from idle consults the gate.
     if (this.confirm?.tryPhrase(transcript)) {
       this.sink.sendHeard("confirm", transcript);
-      this.sink.sendState("idle");
+      // resolved a pending confirm rather than interrupting — release the duck
+      if (this.active) this.sink.sendBarge("resume");
+      this.sink.sendState(this.active ? "speaking" : "idle");
       return;
     }
     if (this.isEndPhrase(transcript)) {
@@ -534,6 +549,10 @@ export class Session {
   private truncateInterrupted(): string | null {
     const turn = this.active;
     if (!turn) return null;
+    // A performance is actually being stopped — drop whatever TTS the client
+    // still has buffered. This is the only place a live performance dies (voice
+    // barge, text barge, Esc/orb, session end), so it's the one place to cut.
+    this.sink.sendBarge("cut");
     turn.abort.abort();
     const performed = turn.queue.interrupt();
     this.active = null;
@@ -632,7 +651,12 @@ export class Session {
 
     const compiler = new PerformanceCompiler(turnId, {
       onItem: (item) => queue.enqueue(item),
-      onWarning: (m) => this.warn(m, turnId),
+      // A directive the compiler rejects (bad ref scheme, malformed markup, a
+      // <show> with no content) produces NOTHING on the stage and — unlike a
+      // failed ref fetch — never reaches the stage to fault on its own. Feed it
+      // into the same corrective loop so the brain learns its show didn't render
+      // and re-emits it, instead of assuming silence meant success.
+      onWarning: (m) => this.reportStageFault("directive-dropped", m, turnId),
     });
 
     this.active = { turnId, queue, abort, sayTextsPlayed: [] };
@@ -729,7 +753,12 @@ export class Session {
       queue.endOfItems();
       await queue.whenDone();
 
-      if (!result.aborted && this.active?.turnId === turnId) {
+      if (result.error && !result.aborted) {
+        // The backend ended the turn on a non-success result (the CLI's
+        // error_during_execution) — usually with no speech at all. Never let
+        // that land as a silent turn; surface it like a thrown error.
+        this.failTurn(turnId, compiler, `brain result ${result.error}`);
+      } else if (!result.aborted && this.active?.turnId === turnId) {
         this.active = null;
         this.openTools.clear();
         this.emitActivity({ kind: "turn", phase: "end", status: "ok", turn: turnId, agent: "main" });
@@ -741,22 +770,27 @@ export class Session {
     } catch (err) {
       if (thoughtTimer) clearTimeout(thoughtTimer);
       thoughtTimer = null;
-      if (this.active?.turnId === turnId) {
-        this.active = null;
-        this.openTools.clear();
-        // design: Failure UX — one canned apology + caption detail, never silent
-        this.warn(`brain error: ${String(err)}`, turnId);
-        this.sink.sendItem({
-          kind: "say",
-          seq: compiler.nextSeq,
-          turnId,
-          text: "Sorry — I hit an error mid-thought. Try that again?",
-        });
-        this.emitActivity({ kind: "turn", phase: "end", status: "error", turn: turnId, agent: "main" });
-        this.sink.sendTurnEnd(turnId);
-        this.sink.sendState("degraded");
-      }
+      this.failTurn(turnId, compiler, `brain error: ${String(err)}`);
     }
+  }
+
+  // Failure UX (design): a turn that ends in error must never be silent — one
+  // canned apology, a caption carrying the detail, and the channel drops to
+  // degraded. Shared by thrown exceptions and non-success backend results.
+  private failTurn(turnId: string, compiler: PerformanceCompiler, detail: string): void {
+    if (this.active?.turnId !== turnId) return;
+    this.active = null;
+    this.openTools.clear();
+    this.warn(detail, turnId);
+    this.sink.sendItem({
+      kind: "say",
+      seq: compiler.nextSeq,
+      turnId,
+      text: "Sorry — I hit an error mid-thought. Try that again?",
+    });
+    this.emitActivity({ kind: "turn", phase: "end", status: "error", turn: turnId, agent: "main" });
+    this.sink.sendTurnEnd(turnId);
+    this.sink.sendState("degraded");
   }
 
   private firstTokenLogged = new Set<string>();

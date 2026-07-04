@@ -32,6 +32,10 @@ export interface TurnResult {
   // used as the assistant history entry on clean completion
   fullText: string;
   aborted: boolean;
+  // set when the backend ended the turn on a non-success result (e.g. the CLI's
+  // error_during_execution) — the turn produced no/partial speech and must be
+  // surfaced by Session, never swallowed as a silent reply.
+  error?: string;
 }
 
 // Tier-1 conversational loop: one logical turn may span several generations when

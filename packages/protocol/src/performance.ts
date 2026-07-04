@@ -1,10 +1,12 @@
 import { z } from "zod";
 
-// Exhibit content is by-reference (ref schemes: wiki:, img:, tool:) or inline payload.
-// At M0, before any MCP server exists, inline payload is the only path.
+// Exhibit content is by-reference (ref schemes: wiki:, file:, img:, tool:) or inline
+// payload. file: is a repo-relative path to Jarvis's own source/docs, resolved by
+// jarvisd's /ref endpoint — it must be in this set or the compiler silently drops
+// every file: show the prompt tells the model to emit.
 export const ExhibitRef = z
   .string()
-  .regex(/^(wiki|img|tool):.+$/, "ref must be scheme:path (wiki:|img:|tool:)");
+  .regex(/^(wiki|file|img|tool):.+$/, "ref must be scheme:path (wiki:|file:|img:|tool:)");
 
 export const Exhibit = z.discriminatedUnion("type", [
   z.object({

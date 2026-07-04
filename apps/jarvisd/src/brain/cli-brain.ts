@@ -37,7 +37,7 @@ export interface CliBrainOptions {
 
 interface ActiveTurn {
   cb: BrainCallbacks;
-  resolve: (r: { fullText: string; aborted: boolean }) => void;
+  resolve: (r: { fullText: string; aborted: boolean; error?: string }) => void;
   fullText: string; // what was SPOKEN (say text; or the fallback scratch)
   scratch: string; // plain text the model emitted outside say — private workspace
   saySeen: boolean;
@@ -135,17 +135,25 @@ export class CliBrain implements BrainPort {
           const turn = this.active;
           if (turn && !turn.discarding) turn.cb.onThought?.(delta);
         },
-        onResult: () => {
+        onResult: (_text, subtype) => {
           // turn complete (or the discarded remnant of an interrupted one)
           const turn = this.active;
           if (turn && !turn.discarding) {
-            // Deliberate silence is a valid reply (blank input, nothing to add).
-            // Scratch text is NEVER spoken — an earlier speak-the-scratch fallback
-            // surfaced the model's private "staying quiet" notes aloud. Log only.
-            if (!turn.saySeen && turn.scratch.trim()) {
-              console.log(`[cli-brain] silent turn; scratch: ${turn.scratch.trim().slice(0, 200)}`);
+            if (subtype !== "success") {
+              // The child errored mid-turn (e.g. error_during_execution),
+              // usually emitting no say text. Report it so Session can apologize
+              // — resolving as a normal silent turn is exactly the "Jarvis wanted
+              // to answer but nothing came out" bug.
+              turn.resolve({ fullText: turn.fullText, aborted: false, error: subtype });
+            } else {
+              // Deliberate silence is a valid reply (blank input, nothing to add).
+              // Scratch text is NEVER spoken — an earlier speak-the-scratch fallback
+              // surfaced the model's private "staying quiet" notes aloud. Log only.
+              if (!turn.saySeen && turn.scratch.trim()) {
+                console.log(`[cli-brain] silent turn; scratch: ${turn.scratch.trim().slice(0, 200)}`);
+              }
+              turn.resolve({ fullText: turn.fullText, aborted: false });
             }
-            turn.resolve({ fullText: turn.fullText, aborted: false });
           }
           this.active = null;
           this.sayIndex = null;
@@ -194,7 +202,7 @@ export class CliBrain implements BrainPort {
     const facts = this.opts.facts();
     const content = facts ? `<facts>\n${facts}\n</facts>\n\n${userText}` : userText;
 
-    return new Promise<{ fullText: string; aborted: boolean }>((resolve) => {
+    return new Promise<{ fullText: string; aborted: boolean; error?: string }>((resolve) => {
       // set active BEFORE writing so a fast first delta isn't dropped
       const turn: ActiveTurn = {
         cb, resolve, fullText: "", scratch: "", saySeen: false, aborted: false, discarding: false,
@@ -312,6 +320,8 @@ const ESCAPES: Record<string, string> = {
 
 const CLI_PREAMBLE = `IMPORTANT: You are NOT a coding assistant in this session; ignore any \
 default coding-agent framing — everything below defines who you are. Rafe hears ONLY text \
-you pass to the say tool; plain text you output is never seen or heard, so never answer in \
-plain text. The Bash tool is the shell referred to below. Do not use Edit, Write, \
-NotebookEdit, or todo tools; wiki edits go only through the wiki MCP tools.\n\n`;
+you pass to the say tool; plain text you output is never seen or heard by anyone, so never \
+answer in plain text — not even a one-liner, not even the wrap-up message you'd normally end \
+a turn with. If a reply is owed, it goes through say. The Bash tool is the shell referred to \
+below. Do not use Edit, Write, NotebookEdit, or todo tools; wiki edits go only through the \
+wiki MCP tools.\n\n`;

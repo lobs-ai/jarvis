@@ -130,6 +130,9 @@ const player = new Player(
         beginUtterance();
         flushBargeBuffer();
       }
+      // Jarvis finished on his own while a barge was streaming: there's no
+      // performance left to cut, so it's just a normal utterance now.
+      bargeCommitted = false;
       player.unduck(); // never leave the gain low between performances
     }
     micUi();
@@ -149,14 +152,19 @@ let level = 0;
 
 const MIN_UTTER_MS = 350; // shorter → likely a cough/click; cancel, don't transcribe
 
-// ── barge-in (§6.2): duck immediately, commit only on sustained speech ──
-// While Jarvis speaks, the first voice-like energy DUCKS the TTS (cheap,
-// reversible); only sustained speech past this gate commits to a real
-// interrupt (flush + brain interrupt). A syllable or a cough ducks but never
-// commits. Audio is buffered locally between duck and commit so the utterance
-// loses nothing if it does commit.
+// ── barge-in (§6.2): duck immediately, cut only on real WORDS ──
+// Three stages while Jarvis speaks:
+//   1. first voice-like energy → DUCK the TTS (cheap, reversible).
+//   2. sustained energy past the gate → open a server utterance and stream it
+//      for STT, still ducked (bargeCommitted). We do NOT stop Jarvis here —
+//      energy alone is a cough, leaked TTS, or room noise as often as speech.
+//   3. the server transcribes and rules: real words → "barge:cut" (flush the
+//      old performance); nothing → "barge:resume" (un-duck, keep talking).
+// Only recognized speech ever interrupts Jarvis. Audio is buffered between
+// duck and stream so a committed utterance loses nothing.
 const BARGE_COMMIT_MS = 550;
-let bargePending = false;
+let bargePending = false; // ducked, buffering, not yet streaming (pre-gate)
+let bargeCommitted = false; // ducked and streaming to STT, awaiting the verdict
 let bargeBuffer: Uint8Array[] = [];
 let bargeBufferedMs = 0;
 
@@ -173,9 +181,12 @@ function flushBargeBuffer(): void {
 }
 
 function commitBarge(): void {
+  // Sustained voice-like energy: promote from ducked-buffering to ducked-and-
+  // streaming. Open the server utterance so STT can rule on it, but keep Jarvis
+  // ducked (not flushed) and send NO interrupt — only real words, confirmed by
+  // the server's "barge:cut", ever stop him. A resume verdict un-ducks instead.
   bargePending = false;
-  player.flush(); // stop our own voice this instant
-  wire.send({ type: "interrupt" }); // stop generation + queue daemon-side
+  bargeCommitted = true;
   beginUtterance();
   flushBargeBuffer();
 }
@@ -213,7 +224,11 @@ const endpointer = new Endpointer({
     }
     utteranceActive = false;
     renderState();
-    wire.send(durMs < MIN_UTTER_MS ? { type: "mic.cancel" } : { type: "mic.end" });
+    // A committed barge stays ducked until the server's verdict, so it must end
+    // with mic.end (STT runs, verdict returns) — never mic.cancel, which would
+    // strand the duck. Only genuinely short idle blips cancel.
+    const end = bargeCommitted || durMs >= MIN_UTTER_MS;
+    wire.send(end ? { type: "mic.end" } : { type: "mic.cancel" });
   },
   onLevel: (rms) => {
     level = Math.max(rms, level * 0.82); // fast attack, slow decay
@@ -257,6 +272,7 @@ async function toggleMic(): Promise<void> {
     micOn = false;
     mic.disarm();
     bargePending = false;
+    bargeCommitted = false;
     bargeBuffer = [];
     player.unduck();
     if (endpointer.cancel() && utteranceActive) wire.send({ type: "mic.cancel" });
@@ -490,6 +506,19 @@ const wire = new Wire({
         document
           .querySelectorAll<HTMLElement>(`[data-confirm-id="${msg.confirmId}"]`)
           .forEach((el) => el.remove());
+        return;
+      }
+      case "barge": {
+        // §6.2 stage-two verdict on a committed acoustic barge. "cut": real
+        // words landed and the old performance was truncated — drop its audio.
+        // "resume": it was noise, so un-duck and let Jarvis carry on. Either way
+        // the barge is resolved.
+        if (msg.verdict === "cut") player.flush(); // flush() also un-ducks
+        else player.unduck();
+        bargePending = false;
+        bargeCommitted = false;
+        bargeBuffer = [];
+        bargeBufferedMs = 0;
         return;
       }
       case "session.reset":

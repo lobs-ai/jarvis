@@ -110,6 +110,11 @@ export const ServerMessage = z.discriminatedUnion("type", [
     phrases: z.array(z.string()), // exact-match spoken confirmations accepted
   }),
   z.object({ type: z.literal("confirm.resolved"), confirmId: z.string(), approved: z.boolean() }),
+  // acoustic barge verdict (§6.2 stage two): the mic ducked Jarvis on voice-like
+  // energy, then streamed the utterance for STT. "cut" = real words — the old
+  // performance was truncated, drop its buffered audio. "resume" = noise/silence
+  // — nothing was said, un-duck and let Jarvis keep talking.
+  z.object({ type: z.literal("barge"), verdict: z.enum(["cut", "resume"]) }),
   z.object({ type: z.literal("error"), message: z.string(), detail: z.string().optional() }),
   // conversation was reset (via UI button or settings change) — clear the room
   z.object({ type: z.literal("session.reset") }),

@@ -272,6 +272,13 @@ async function main(): Promise<void> {
   session.onSessionEnd = (closedId) => {
     brainRestartPending = false; // the reset already delivered any pending change
     if (!cfg.ambient_drafting || !subagents) return;
+    // Don't stack ambient drafts: if a prior one is still generating, skip this
+    // one. Ambient drafting is best-effort (proposing nothing is fine), and two
+    // background Opus children at once starve the next foreground voice turn.
+    if (subagents.hasWorkingLabel(AMBIENT_LABEL)) {
+      console.log(`[ambient] draft skipped for ${closedId}: a prior draft is still working`);
+      return;
+    }
     const events = store.readSession(closedId);
     if (!hasSubstance(events)) return;
     try {
