@@ -78,7 +78,7 @@ separate plain-markdown repo, reached through one of those MCP servers like any 
                                   │         (swappable)   ▼ items back
                     ┌─────────┬───┴─────┬──────────┐      to stage
                     │  wiki   │ browser │ terminal │   STT :7423 (whisper.cpp)
-                    │ server  │(AS+CDP) │  server  │   TTS :7422 (Chatterbox)
+                    │ server  │(AS+CDP) │  server  │   TTS :7422 (Kokoro)
                     └─────────┴─────────┴──────────┘   [hosted adapters if needed]
                         + any ecosystem MCP server (calendar, email, …)
 ```
@@ -446,7 +446,7 @@ word to Jarvis's first audio — which includes terms an end-of-speech budget co
 | endpointing | 0.3–0.5s | trailing-silence wait before "utterance over"; shorter false-endpoints on natural pauses — and technical speech is full of think-pauses (lobs-voice shipped 0.8s — tune carefully, expect a compromise) |
 | transcript | ≈0.3s *for short utterances* | whisper-server decodes the whole utterance after endpointing — latency **scales with utterance length**, and a 15-second question blows this line. Assumes the CoreML/ANE encoder, a *separate generation step* the plain make build does not produce — `bin/jarvis` treats it as a first-class build stage; the Metal fallback is slower. Designated fix if long utterances hurt: incremental chunked transcription during speech (rolling ~3s chunks transcribed while Rafe is still talking, only the tail decoded at endpoint) — an upgrade path, not v0 |
 | first token | 0.5–0.9s | `claude-sonnet-5`, thinking off, prompt-cached system/tools; the bundle's ~2k-token cap exists partly to bound this |
-| first audio | 0.6–0.9s | Chatterbox blocks per request (no sub-sentence streaming), so opener length is the lever: the prompt keeps openers short, and the compiler may split a long first sentence at a clause boundary — accepting the prosody cost (an intonationally dangling fragment) only when the opener would otherwise blow the line. Per-sentence zero-shot cloning can also drift timbre across a long answer; noted, tolerated at v0 |
+| first audio | 0.6–0.9s | Kokoro (the default on :7422) blocks per request (no sub-sentence streaming), so opener length is the lever: the prompt keeps openers short, and the compiler may split a long first sentence at a clause boundary — accepting the prosody cost (an intonationally dangling fragment) only when the opener would otherwise blow the line. Per-sentence zero-shot cloning can also drift timbre across a long answer; noted, tolerated at v0 |
 
 Perceived total: **≤2.0s typical warm for short-to-medium utterances, 3.0s ceiling.** Two known
 potholes: the TTS server has a documented cold path after idle (MPS staleness → retry doubles
@@ -459,8 +459,8 @@ achievable with this local stack; it requires hosted realtime adapters. That swa
 
 **M1 measurement outcome (2026-07-02, M3 Pro):** Chatterbox on MPS measured ~30s per sentence
 *warm* (~0.14× realtime) — unusable for conversation; the designated Kokoro fallback fires.
-The default TTS sidecar is now Kokoro-82M via ONNX (voice `bm_george`; measured 1.6s for 5.6s
-of audio, ~3.5× realtime — short openers well inside the 0.6–0.9s line), with Chatterbox kept
+The default TTS sidecar is now Kokoro-82M via ONNX (voice `bm_george`; **re-measured 2026-07-03,
+M3 Pro: ~0.97s for 5.74s of audio, ~6× realtime** — short openers well inside the 0.6–0.9s line), with Chatterbox kept
 as the optional cloning path on :7425 (`sidecars/tts/start-chatterbox.sh`) for when a cloned
 persona voice matters more than latency, or better hardware arrives. Whisper on the generated
 ANE encoder measured 145–615ms warm. The local stack holds; no hosted swap needed.
@@ -547,7 +547,7 @@ jarvis/
     voice/src/
       ports.ts                     SttPort/TtsPort interfaces + config selection
       stt-whisper.ts               local adapter → whisper.cpp server :7423
-      tts-chatterbox.ts            local adapter → Chatterbox server :7422 (sentence streaming)
+      tts-chatterbox.ts            generic HTTP TTS adapter → :7422 (Kokoro default; name predates the swap)
                                    (hosted adapters land here later behind the same ports)
   apps/
     jarvisd/src/

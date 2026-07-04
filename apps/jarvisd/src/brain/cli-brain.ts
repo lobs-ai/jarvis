@@ -1,37 +1,19 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ThinkingLevel } from "@jarvis/protocol";
 import { buildSystemPrompt } from "./prompt.js";
 import { snapshotWiki } from "./wiki-index.js";
 import type { BrainPort, BrainCallbacks } from "./port.js";
+import {
+  PersistentClaude,
+  type CliServerSpec,
+} from "./persistent-claude.js";
 
-// Env vars that would steer the Claude CLI to an API key / Bedrock / Vertex
-// instead of Rafe's Claude Code OAuth subscription. Cleared from the child.
-// (Mirrors lobs-core's CLAUDE_CLI_CLEAR_ENV — the whole point is subscription.)
-const CLEAR_ENV = [
-  "ANTHROPIC_API_KEY", "ANTHROPIC_API_TOKEN", "ANTHROPIC_AUTH_TOKEN",
-  "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_OAUTH_TOKEN",
-  "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
-];
-
-const MODEL_ALIAS: Record<string, string> = {
-  "claude-sonnet-5": "sonnet",
-  "claude-fable-5": "opus", // fable rides the Opus-tier subscription entitlement
-  "claude-opus-4-8": "opus",
-  "claude-haiku-4-5": "haiku",
-};
+export type { CliServerSpec } from "./persistent-claude.js";
 
 // Speech-as-tool (Rafe's redesign): the model is silent by default and speaks
 // by calling this tool. jarvisd streams the tool's input text to the compiler
 // from input_json_delta events — speech starts before the call even completes,
 // and the stub server acks instantly so talking overlaps working.
 const SAY_TOOL = "mcp__speech__say";
-
-export interface CliServerSpec {
-  name: string;
-  command: string;
-  args: string[];
-  env?: Record<string, string>;
-}
 
 export interface CliBrainOptions {
   binary?: string;
@@ -44,7 +26,7 @@ export interface CliBrainOptions {
   // Mutating wiki/browser tools are excluded — jarvisd gates those (design §Security).
   allowedTools: string[];
   disallowedTools: string[];
-  onToolCall?: (name: string) => void;
+  // out-of-turn hook (gateProposal): fires for every non-say tool result
   onToolResult?: (name: string, text: string) => void;
   facts: () => string | null;
 }
@@ -66,19 +48,16 @@ interface ActiveTurn {
 // One warm `claude` process per session in stream-json in/out mode: MCP servers
 // initialize once and stay warm across turns, avoiding the per-invocation
 // cold-start tax that makes per-turn `claude -p` spawning fatal for voice.
+// The child-spawn + stream parse guts live in PersistentClaude (shared with
+// tier-2 subagents); this class owns turn lifecycle and the say-tool voice.
 export class CliBrain implements BrainPort {
   readonly kind = "cli" as const;
-  private child: ChildProcessWithoutNullStreams | null = null;
+  private pc: PersistentClaude | null = null;
   private active: ActiveTurn | null = null;
   private busy = false;
   private freeWaiters: Array<() => void> = [];
-  private stdoutBuf = "";
-  // tool_use id → tool name, so tool_result blocks attribute correctly even
-  // when say calls interleave with real work in the same assistant message.
-  private toolNames = new Map<string, string>();
   private sayIndex: number | null = null; // content-block index of an in-flight say
   private sayExtractor: SayTextExtractor | null = null;
-  private readyLogged = false;
   // settings-mutable; baked into the child at spawn, so changes need reset()
   private model: string;
   private thinking: ThinkingLevel;
@@ -88,83 +67,96 @@ export class CliBrain implements BrainPort {
     this.thinking = opts.thinking ?? "off";
   }
 
-  private ensureChild(): ChildProcessWithoutNullStreams {
-    if (this.child && !this.child.killed) return this.child;
-
-    // MCP servers need PATH/HOME (tsx resolves `node` via PATH); merge them in.
-    const baseEnv = {
-      PATH: process.env.PATH ?? "",
-      HOME: process.env.HOME ?? "",
-    };
-    const mcpConfig = {
-      mcpServers: Object.fromEntries(
-        this.opts.servers.map((s) => [
-          s.name,
-          { type: "stdio", command: s.command, args: s.args, env: { ...baseEnv, ...(s.env ?? {}) } },
-        ]),
-      ),
-    };
-    const model = MODEL_ALIAS[this.model] ?? this.model;
+  private ensureChild(): PersistentClaude {
+    if (this.pc?.alive) return this.pc;
     const wikiDir = this.opts.wikiDir?.();
-    const args = [
-      "-p",
-      "--input-format", "stream-json",
-      "--output-format", "stream-json",
-      "--include-partial-messages",
-      "--verbose",
-      "--setting-sources", "user",
-      "--permission-mode", "bypassPermissions",
-      "--model", model,
-      "--append-system-prompt",
-      CLI_PREAMBLE +
-        buildSystemPrompt("say-tool", wikiDir, wikiDir ? snapshotWiki(wikiDir) : undefined),
-      "--mcp-config", JSON.stringify(mcpConfig),
-      "--strict-mcp-config",
-      "--allowedTools", this.opts.allowedTools.join(","),
-      "--disallowedTools", this.opts.disallowedTools.join(","),
-    ];
-    if (this.thinking !== "off") args.push("--effort", this.thinking);
-
-    const env: Record<string, string> = {};
-    for (const [k, v] of Object.entries(process.env)) {
-      if (typeof v === "string" && !CLEAR_ENV.includes(k)) env[k] = v;
-    }
-    // Thinking comes from settings (default off — design §Brain: Claude Code
-    // defaults opus to extended thinking, measured ~9s of dead air). Named
-    // levels ride --effort above; deltas stream into the stage's thought line.
-    if (this.thinking === "off") env.MAX_THINKING_TOKENS = "0";
-    // Claude Code 2.1.x defers ALL MCP tools behind ToolSearch by default —
-    // including say, so the model had to search for its own voice (measured:
-    // init listed zero mcp__ tools). Our surface is ~10 tools; pin them all.
-    env.ENABLE_TOOL_SEARCH = "false";
-
-    const child = spawn(this.opts.binary ?? "claude", args, {
-      env,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    this.readyLogged = false; // a genuinely new child announces itself once
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => this.onStdout(chunk));
-    child.stderr.setEncoding("utf8");
-    let stderrTail = "";
-    child.stderr.on("data", (d: string) => {
-      stderrTail = (stderrTail + d).slice(-500);
-      const line = d.trim();
-      if (line) console.error(`[cli-brain stderr] ${line.slice(0, 300)}`);
-    });
-    child.on("error", (err) => {
-      console.error(`[cli-brain] spawn error: ${err.message}`);
-      this.failActive();
-    });
-    child.on("exit", (code) => {
-      if (code && code !== 0) {
-        console.error(`[cli-brain] claude exited ${code}: ${stderrTail.trim().slice(-300)}`);
-      }
-      this.child = null;
-      this.failActive();
-    });
-    this.child = child;
-    return child;
+    const pc = new PersistentClaude(
+      {
+        binary: this.opts.binary,
+        label: "cli-brain",
+        model: this.model,
+        thinking: this.thinking,
+        appendSystemPrompt:
+          CLI_PREAMBLE +
+          buildSystemPrompt("say-tool", wikiDir, wikiDir ? snapshotWiki(wikiDir) : undefined),
+        servers: this.opts.servers,
+        allowedTools: this.opts.allowedTools,
+        disallowedTools: this.opts.disallowedTools,
+      },
+      {
+        onToolStart: (callId, name, index) => {
+          if (name === SAY_TOOL) {
+            // speech begins: stream its input's text field as it generates
+            this.sayIndex = index;
+            this.sayExtractor = new SayTextExtractor();
+            return;
+          }
+          const turn = this.active;
+          if (turn && !turn.discarding) turn.cb.onToolStart?.(callId, name);
+        },
+        onToolInputDelta: (index, _callId, _name, partial) => {
+          if (index !== this.sayIndex || !this.sayExtractor) return;
+          const text = this.sayExtractor.push(partial);
+          const turn = this.active;
+          if (text && turn && !turn.discarding) {
+            turn.saySeen = true;
+            turn.fullText += text;
+            turn.cb.onTextDelta(text);
+          }
+        },
+        onToolInput: (callId, name, input) => {
+          if (name === SAY_TOOL) {
+            this.sayIndex = null;
+            this.sayExtractor = null;
+            return;
+          }
+          const turn = this.active;
+          if (turn && !turn.discarding) turn.cb.onToolCall?.(callId, name, input);
+        },
+        onToolResult: (callId, name, output, isError, durationMs) => {
+          if (name === SAY_TOOL) return;
+          const turn = this.active;
+          if (turn && !turn.discarding) {
+            turn.cb.onToolResult?.(callId, name, output, isError, durationMs);
+          }
+          this.opts.onToolResult?.(name, output);
+        },
+        onText: (delta) => {
+          // Plain text is the model's private workspace — never spoken, but
+          // streamed to the stage as the dim inner-monologue line.
+          const turn = this.active;
+          if (turn && !turn.discarding) {
+            turn.scratch += delta;
+            turn.cb.onThought?.(delta);
+          }
+        },
+        onThinking: (delta) => {
+          // extended thinking (when enabled) is inner monologue too
+          const turn = this.active;
+          if (turn && !turn.discarding) turn.cb.onThought?.(delta);
+        },
+        onResult: () => {
+          // turn complete (or the discarded remnant of an interrupted one)
+          const turn = this.active;
+          if (turn && !turn.discarding) {
+            // Deliberate silence is a valid reply (blank input, nothing to add).
+            // Scratch text is NEVER spoken — an earlier speak-the-scratch fallback
+            // surfaced the model's private "staying quiet" notes aloud. Log only.
+            if (!turn.saySeen && turn.scratch.trim()) {
+              console.log(`[cli-brain] silent turn; scratch: ${turn.scratch.trim().slice(0, 200)}`);
+            }
+            turn.resolve({ fullText: turn.fullText, aborted: false });
+          }
+          this.active = null;
+          this.sayIndex = null;
+          this.sayExtractor = null;
+          this.setBusy(false);
+        },
+        onExit: () => this.failActive(),
+      },
+    );
+    this.pc = pc;
+    return pc;
   }
 
   private failActive(): void {
@@ -196,7 +188,7 @@ export class CliBrain implements BrainPort {
     // must NOT be sent — the child would grind through a stale agentic loop
     // while fresh turns pile up behind untilFree. That was the "stuck" bug.
     if (signal.aborted) return { fullText: "", aborted: true };
-    const child = this.ensureChild();
+    const pc = this.ensureChild();
     this.setBusy(true);
 
     const facts = this.opts.facts();
@@ -208,9 +200,7 @@ export class CliBrain implements BrainPort {
         cb, resolve, fullText: "", scratch: "", saySeen: false, aborted: false, discarding: false,
       };
       this.active = turn;
-      child.stdin.write(
-        JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n",
-      );
+      pc.sendUser(content);
       const onAbort = (): void => {
         // Barge-in: stop forwarding deltas immediately, tell the child to stop
         // generating, and hand control back. Whatever remnant still streams is
@@ -218,160 +208,13 @@ export class CliBrain implements BrainPort {
         // instead of after the full agentic loop.
         turn.aborted = true;
         turn.discarding = true;
-        this.sendInterrupt();
+        pc.interrupt();
         signal.removeEventListener("abort", onAbort);
         resolve({ fullText: turn.fullText, aborted: true });
       };
       if (signal.aborted) return onAbort();
       signal.addEventListener("abort", onAbort);
     });
-  }
-
-  private interruptSeq = 0;
-  // stream-json control protocol: cancels the in-flight generation; the child
-  // answers with a result event for the cancelled turn (freeing `busy`).
-  private sendInterrupt(): void {
-    if (!this.child || this.child.killed) return;
-    try {
-      this.child.stdin.write(
-        JSON.stringify({
-          type: "control_request",
-          request_id: `jarvis_int_${++this.interruptSeq}`,
-          request: { subtype: "interrupt" },
-        }) + "\n",
-      );
-    } catch {
-      /* best-effort — worst case we discard until the natural result */
-    }
-  }
-
-  private onStdout(chunk: string): void {
-    this.stdoutBuf += chunk;
-    let nl: number;
-    while ((nl = this.stdoutBuf.indexOf("\n")) !== -1) {
-      const line = this.stdoutBuf.slice(0, nl).trim();
-      this.stdoutBuf = this.stdoutBuf.slice(nl + 1);
-      if (line) this.onEvent(line);
-    }
-  }
-
-  private onEvent(line: string): void {
-    let e: Record<string, unknown>;
-    try {
-      e = JSON.parse(line);
-    } catch {
-      return;
-    }
-    const turn = this.active;
-    const type = e.type as string;
-
-    if (process.env.JARVIS_BRAIN_DEBUG) {
-      const se = (e.event ?? {}) as Record<string, unknown>;
-      const detail = type === "stream_event" ? `/${se.type}` : "";
-      console.log(`[cli-brain dbg] ${type}${detail} ${line.slice(0, 140)}`);
-    }
-
-    // startup + failure visibility: init tells us the child is actually up;
-    // an error-subtyped result would otherwise vanish into the discard path.
-    // Claude Code emits system/init once per QUERY, not per process — log only
-    // the first, or the line reads like a per-turn respawn (it isn't; verified
-    // by test-continuity.mts).
-    if (type === "system" && e.subtype === "init") {
-      if (!this.readyLogged) {
-        this.readyLogged = true;
-        console.log(`[cli-brain] child ready (model ${(e as { model?: string }).model ?? "?"})`);
-      }
-    } else if (type === "result" && typeof e.subtype === "string" && e.subtype !== "success") {
-      console.error(`[cli-brain] result ${e.subtype}: ${String(e.result ?? "").slice(0, 200)}`);
-    }
-
-    if (type === "stream_event") {
-      const se = (e.event ?? {}) as Record<string, unknown>;
-      const index = typeof se.index === "number" ? se.index : -1;
-
-      if (se.type === "content_block_start") {
-        const block = (se.content_block ?? {}) as Record<string, unknown>;
-        if (block.type === "tool_use" && typeof block.name === "string") {
-          if (typeof block.id === "string") this.toolNames.set(block.id, block.name);
-          if (block.name === SAY_TOOL) {
-            // speech begins: stream its input's text field as it generates
-            this.sayIndex = index;
-            this.sayExtractor = new SayTextExtractor();
-          } else {
-            if (turn && !turn.discarding) turn.cb.onToolCall?.(block.name);
-            this.opts.onToolCall?.(block.name);
-          }
-        }
-        return;
-      }
-
-      if (se.type === "content_block_delta") {
-        const delta = (se.delta ?? {}) as Record<string, unknown>;
-        if (
-          delta.type === "input_json_delta" &&
-          index === this.sayIndex &&
-          this.sayExtractor &&
-          typeof delta.partial_json === "string"
-        ) {
-          const text = this.sayExtractor.push(delta.partial_json);
-          if (text && turn && !turn.discarding) {
-            turn.saySeen = true;
-            turn.fullText += text;
-            turn.cb.onTextDelta(text);
-          }
-        } else if (delta.type === "text_delta" && typeof delta.text === "string") {
-          // Plain text is the model's private workspace now — never spoken,
-          // but streamed to the stage as the dim inner-monologue line.
-          if (turn && !turn.discarding) {
-            turn.scratch += delta.text;
-            turn.cb.onThought?.(delta.text);
-          }
-        } else if (delta.type === "thinking_delta" && typeof delta.thinking === "string") {
-          // extended thinking (when enabled) is inner monologue too
-          if (turn && !turn.discarding) turn.cb.onThought?.(delta.thinking);
-        }
-        return;
-      }
-
-      if (se.type === "content_block_stop" && index === this.sayIndex) {
-        this.sayIndex = null;
-        this.sayExtractor = null;
-      }
-      return;
-    }
-
-    // tool results arrive as user-role messages injected by Claude Code
-    if (type === "user") {
-      const msg = (e.message ?? {}) as { content?: unknown };
-      const blocks = Array.isArray(msg.content) ? msg.content : [];
-      for (const raw of blocks) {
-        const b = raw as Record<string, unknown>;
-        if (b.type === "tool_result") {
-          const name =
-            typeof b.tool_use_id === "string" ? this.toolNames.get(b.tool_use_id) ?? "" : "";
-          if (name !== SAY_TOOL) this.opts.onToolResult?.(name, extractText(b.content));
-        }
-      }
-      return;
-    }
-
-    if (type === "result") {
-      // turn complete (or the discarded remnant of an interrupted one)
-      if (turn && !turn.discarding) {
-        // Deliberate silence is a valid reply (blank input, nothing to add).
-        // Scratch text is NEVER spoken — an earlier speak-the-scratch fallback
-        // surfaced the model's private "staying quiet" notes aloud. Log only.
-        if (!turn.saySeen && turn.scratch.trim()) {
-          console.log(`[cli-brain] silent turn; scratch: ${turn.scratch.trim().slice(0, 200)}`);
-        }
-        turn.resolve({ fullText: turn.fullText, aborted: false });
-      }
-      this.active = null;
-      this.sayIndex = null;
-      this.sayExtractor = null;
-      this.toolNames.clear();
-      this.setBusy(false);
-    }
   }
 
   recordInterrupted(): void {
@@ -388,43 +231,24 @@ export class CliBrain implements BrainPort {
   // Spawn the child now (boot / right after reset) so MCP servers connect
   // before the first turn — a turn racing a cold child found say unregistered.
   warm(): void {
-    this.ensureChild();
+    this.ensureChild().ensure();
   }
 
   // Fresh conversation: kill the warm child (its process IS the history) and
   // let the next turn spawn a new one with the current model/thinking/prompt.
   reset(): void {
-    const child = this.child;
-    this.child = null; // detach first so the exit handler can't double-fail
-    if (child && !child.killed) {
-      child.stdin.end();
-      child.kill();
-    }
+    const pc = this.pc;
+    this.pc = null; // detach first so the exit handler can't double-fail
+    pc?.kill();
     this.failActive();
-    this.toolNames.clear();
     this.sayIndex = null;
     this.sayExtractor = null;
-    this.stdoutBuf = "";
   }
 
   dispose(): void {
-    this.child?.stdin.end();
-    this.child?.kill();
-    this.child = null;
+    this.pc?.kill();
+    this.pc = null;
   }
-}
-
-function extractText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((b) => {
-        const x = b as Record<string, unknown>;
-        return x.type === "text" && typeof x.text === "string" ? x.text : "";
-      })
-      .join("\n");
-  }
-  return "";
 }
 
 // Incremental extractor for the say tool's streamed input: pulls the VALUE of

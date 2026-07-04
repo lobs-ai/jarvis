@@ -17,6 +17,7 @@ export class StatusStrip {
   private model = $("#ssModel");
   private thinking = $("#ssThinking");
   private wiki = $("#ssWiki");
+  private wake = $("#ssWake");
   private earsDot = $("#ssEars .hdot");
   private voiceDot = $("#ssVoice .hdot");
   private brainDot = $("#ssBrain .hdot");
@@ -29,6 +30,14 @@ export class StatusStrip {
     this.thinking.textContent = s.thinking;
     this.wiki.textContent = basename(s.wiki_dir);
     this.wiki.title = s.wiki_dir;
+    // Layer 4 wake state: when the gate is on, an idle utterance becomes a
+    // turn only if it starts with the word — surface that so a dropped turn is
+    // never a mystery.
+    const gated = s.wake_enabled && s.wake_word.length > 0;
+    this.wake.textContent = gated ? `say “${s.wake_word}…”` : "off";
+    this.wake.title = gated
+      ? `Idle voice input needs the wake word "${s.wake_word}" (confirmations and barge-in don't)`
+      : "Wake word off — every utterance becomes a turn";
   }
 
   // null → we couldn't reach /status (offline or endpoint missing): show unknown.

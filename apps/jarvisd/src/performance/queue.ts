@@ -23,6 +23,9 @@ export interface QueueOptions {
   lookahead?: number; // TTS segments generated ahead of the playhead
   // pronunciation substitutions applied to TTS input only (captions keep authored text)
   ttsTextTransform?: (text: string) => string;
+  // a say segment's played-ack never arrived: audio very likely didn't play
+  // (unarmed player, sleeping tab). Feeds the stage-fault loop.
+  onFault?: (item: PerformanceItem) => void;
 }
 
 // Sequence-numbered, strict in-order playback. Lookahead pays off because
@@ -88,6 +91,26 @@ export class PerformanceQueue {
 
   get wasInterrupted(): boolean {
     return this.interrupted;
+  }
+
+  // ── interrupt-note bookkeeping (§6.3): how much of the performance the
+  // audience actually got, so the model knows the scale of what was missed ──
+  get totalSays(): number {
+    return this.items.filter((i) => i.kind === "say").length;
+  }
+
+  get performedSays(): number {
+    return this.performed.filter((i) => i.kind === "say").length;
+  }
+
+  // exhibits that were generated but never reached the stage
+  unperformedShows(): Array<{ id: string; title?: string }> {
+    const out: Array<{ id: string; title?: string }> = [];
+    for (let i = this.playhead; i < this.items.length; i++) {
+      const item = this.items[i]!;
+      if (item.kind === "show") out.push({ id: item.id, title: item.exhibit.title });
+    }
+    return out;
   }
 
   private prefetchTts(): void {
@@ -156,6 +179,7 @@ export class PerformanceQueue {
             console.log(
               `[queue] no played-ack for ${item.turnId}:${item.seq} after ${Math.round(durationMs + ACK_GRACE_MS)}ms — advancing`,
             );
+            this.opts.onFault?.(item);
             resolve();
           }, durationMs + ACK_GRACE_MS);
           this.acks.set(item.seq, () => {

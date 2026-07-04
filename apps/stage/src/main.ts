@@ -28,15 +28,30 @@ const quietIcon = $(".control-icon", quietToggle);
 const newConvo = $<HTMLButtonElement>("#newConvo");
 const exhibitsEl = $("#exhibits");
 const clearExhibits = $<HTMLButtonElement>("#clearExhibits");
+const ssStop = $<HTMLButtonElement>("#ssStop");
 
 // ── UI modules ───────────────────────────────────────────────
 const transcript = new Transcript($("#transcript"), $("#conversationPane"));
 const toasts = new Toasts($("#toasts"));
 const lightbox = new Lightbox();
+
+// Stage-fault reporting: when the model's performance breaks on screen (or in
+// the speakers), tell jarvisd — it folds faults into a corrective system turn
+// so the model fixes its own show without Rafe having to say "that broke".
+function reportFault(
+  kind: "exhibit-unresolved" | "missing-target" | "audio-blocked" | "audio-error",
+  detail: string,
+  turnId?: string,
+): void {
+  if (turnId === "wiki-browser") return; // Rafe's own browsing, not the model's show
+  wire.send({ type: "stage.fault", kind, detail: detail.slice(0, 400), turnId });
+}
+
 const exhibits = new Exhibits(
   exhibitsEl,
   (card) => lightbox.open(card), // click a card → maximize
   (card) => lightbox.closeIfShowing(card), // card evicted/swept → drop the lightbox
+  reportFault,
 );
 const statusStrip = new StatusStrip();
 
@@ -50,7 +65,11 @@ const tabs = new Tabs($(".tabbar"), $("#tabBody"), (name) => {
   if (name === "wiki") wiki.ensureLoaded();
 });
 
-const activity = new Activity($("#activity"), $("#activityPane"), () => tabs.badge("activity"));
+const activity = new Activity($("#activityPane"), {
+  onSubagentSend: (id, message) => wire.send({ type: "subagent.send", id, message }),
+  onSubagentStop: (id) => wire.send({ type: "subagent.stop", id }),
+  onUnread: () => tabs.badge("activity"),
+});
 
 const settings = new Settings({
   onApply: (patch) => wire.send({ type: "settings.set", patch }),
@@ -80,6 +99,10 @@ function renderState(): void {
   orb.dataset.state = effective;
   statusEl.dataset.state = effective;
   stateLabel.textContent = effective;
+  // tap-to-interrupt affordance: presence must never depend solely on the
+  // risky acoustic path (design §4 Layer 4)
+  const busy = effective === "speaking" || effective === "thinking" || effective === "acting";
+  ssStop.classList.toggle("hidden", !busy);
 }
 
 function setOrb(state: OrbState): void {
@@ -91,16 +114,27 @@ function setOrb(state: OrbState): void {
 const player = new Player(
   (turnId, seq) => wire.send({ type: "played", turnId, seq }),
   (playing) => {
-    // Half-duplex: our own TTS through the speakers must not become an
-    // utterance. While playing, mic frames are dropped (see Mic callback) and
-    // any half-built utterance is abandoned. Interrupt via Esc, typing, or orb.
-    if (playing && endpointer.cancel()) {
+    // Half-duplex fallback (no AEC): our own TTS through the speakers must not
+    // become an utterance — abandon any half-built one when playback starts.
+    // With AEC active the mic stays hot and §6.2's duck/commit machine rules.
+    if (playing && !player.aecActive && endpointer.cancel()) {
       wire.send({ type: "mic.cancel" });
       utteranceActive = false;
       renderState();
     }
+    if (!playing) {
+      if (bargePending) {
+        // playback drained while we were ducked-and-buffering: nothing left to
+        // interrupt — promote the buffered speech to a normal utterance
+        bargePending = false;
+        beginUtterance();
+        flushBargeBuffer();
+      }
+      player.unduck(); // never leave the gain low between performances
+    }
     micUi();
   },
+  reportFault,
 );
 let micSeq = 0;
 const audioMeta = new Map<number, { turnId: string }>();
@@ -115,14 +149,68 @@ let level = 0;
 
 const MIN_UTTER_MS = 350; // shorter → likely a cough/click; cancel, don't transcribe
 
+// ── barge-in (§6.2): duck immediately, commit only on sustained speech ──
+// While Jarvis speaks, the first voice-like energy DUCKS the TTS (cheap,
+// reversible); only sustained speech past this gate commits to a real
+// interrupt (flush + brain interrupt). A syllable or a cough ducks but never
+// commits. Audio is buffered locally between duck and commit so the utterance
+// loses nothing if it does commit.
+const BARGE_COMMIT_MS = 550;
+let bargePending = false;
+let bargeBuffer: Uint8Array[] = [];
+let bargeBufferedMs = 0;
+
+function beginUtterance(): void {
+  utteranceActive = true;
+  renderState();
+  wire.send({ type: "mic.begin", sampleRate: 16000 });
+}
+
+function flushBargeBuffer(): void {
+  for (const pcm of bargeBuffer) wire.sendBinary(encodeBinaryFrame(1, micSeq++, pcm));
+  bargeBuffer = [];
+  bargeBufferedMs = 0;
+}
+
+function commitBarge(): void {
+  bargePending = false;
+  player.flush(); // stop our own voice this instant
+  wire.send({ type: "interrupt" }); // stop generation + queue daemon-side
+  beginUtterance();
+  flushBargeBuffer();
+}
+
 const endpointer = new Endpointer({
   onUtteranceStart: () => {
-    utteranceActive = true;
-    renderState();
-    wire.send({ type: "mic.begin", sampleRate: 16000 });
+    if (player.isPlaying && player.aecActive) {
+      // speaking → ducked: don't open a server utterance yet — the commit gate
+      // decides whether this becomes an interrupt or melts back into playback
+      bargePending = true;
+      bargeBuffer = [];
+      bargeBufferedMs = 0;
+      player.duck();
+      return;
+    }
+    beginUtterance();
   },
-  onAudio: (pcm) => wire.sendBinary(encodeBinaryFrame(1, micSeq++, pcm)),
+  onAudio: (pcm) => {
+    if (bargePending) {
+      bargeBuffer.push(pcm);
+      bargeBufferedMs += (pcm.byteLength / 2 / 16000) * 1000;
+      if (bargeBufferedMs >= BARGE_COMMIT_MS) commitBarge();
+      return;
+    }
+    wire.sendBinary(encodeBinaryFrame(1, micSeq++, pcm));
+  },
   onUtteranceEnd: (durMs) => {
+    if (bargePending) {
+      // ducked but never committed — it was nothing; resume the performance
+      bargePending = false;
+      bargeBuffer = [];
+      bargeBufferedMs = 0;
+      player.unduck();
+      return;
+    }
     utteranceActive = false;
     renderState();
     wire.send(durMs < MIN_UTTER_MS ? { type: "mic.cancel" } : { type: "mic.end" });
@@ -135,7 +223,9 @@ const endpointer = new Endpointer({
 
 const mic = new Mic((pcm) => {
   if (!micOn) return;
-  if (player.isPlaying) return; // half-duplex: drop frames while Jarvis talks
+  // Full duplex only when AEC cancels our own TTS from the mic; otherwise keep
+  // the half-duplex gate (fallbacks: headphones, tap-to-interrupt).
+  if (player.isPlaying && !player.aecActive) return;
   endpointer.push(pcm);
 });
 
@@ -146,7 +236,7 @@ function micUi(): void {
   micToggle.title = micOn
     ? "Mic is on — click or press Space to mute"
     : "Mic is off — click or press Space to listen";
-  micLevel.classList.toggle("muted", !micOn || player.isPlaying);
+  micLevel.classList.toggle("muted", !micOn || (player.isPlaying && !player.aecActive));
   if (!micOn) micLevelFill.style.width = "0%";
 }
 
@@ -166,7 +256,10 @@ async function toggleMic(): Promise<void> {
   } else {
     micOn = false;
     mic.disarm();
-    if (endpointer.cancel()) wire.send({ type: "mic.cancel" });
+    bargePending = false;
+    bargeBuffer = [];
+    player.unduck();
+    if (endpointer.cancel() && utteranceActive) wire.send({ type: "mic.cancel" });
     utteranceActive = false;
     renderState();
   }
@@ -196,6 +289,7 @@ function interruptPerformance(): void {
   player.flush();
   wire.send({ type: "interrupt" });
 }
+ssStop.addEventListener("click", interruptPerformance);
 
 // ── stage panel clear-all (shown at 2+ dismissable exhibits) ─
 function refreshExhibits(): void {
@@ -247,6 +341,19 @@ async function pollStatus(): Promise<void> {
 }
 window.setInterval(() => void pollStatus(), 10_000);
 
+// ── quiet toggle UI (also driven by session.replay adoption) ─
+function setQuietUI(q: boolean): void {
+  quiet = q;
+  const voiceOn = !quiet;
+  quietToggle.classList.toggle("on", voiceOn);
+  quietToggle.setAttribute("aria-pressed", String(voiceOn));
+  quietState.textContent = voiceOn ? "on" : "off";
+  quietIcon.textContent = voiceOn ? "🔊" : "🔇";
+  quietToggle.title = voiceOn
+    ? "Voice on — click for captions only"
+    : "Captions only — click to hear Jarvis speak";
+}
+
 // ── wire ─────────────────────────────────────────────────────
 const wire = new Wire({
   onOpen: () => {
@@ -281,21 +388,19 @@ const wire = new Wire({
       case "turn.begin":
         currentTurnId = msg.turnId;
         currentJarvisLine = null;
-        activity.turnStart(msg.source);
         return;
       case "turn.end":
         if (currentTurnId === msg.turnId) currentTurnId = null;
         currentJarvisLine?.classList.remove("speaking");
         currentJarvisLine = null;
         thoughtLines.delete(msg.turnId); // line stays in the rail as history
-        activity.turnEnd(msg.turnId);
         return;
       case "heard":
         transcript.addLine("user", msg.text);
         return;
       case "thought": {
         // inner monologue: one dim line per turn in conversation, updated in
-        // place; the activity tab keeps the same evolving entry with a timestamp
+        // place (the activity tab renders its own typed row off the event log)
         let line = thoughtLines.get(msg.turnId);
         if (!line) {
           line = transcript.addLine("thought", msg.text);
@@ -304,7 +409,6 @@ const wire = new Wire({
           line.textContent = msg.text;
           transcript.scrollToEnd();
         }
-        activity.thought(msg.turnId, msg.text);
         return;
       }
       case "item": {
@@ -317,12 +421,17 @@ const wire = new Wire({
         if (item.kind === "show") return exhibits.show(item.turnId, item.id, item.exhibit);
         if (item.kind === "update") return exhibits.update(item.turnId, item.ref, item.body);
         if (item.kind === "dismiss") return exhibits.dismiss(item.turnId, item.ref);
-        if (item.kind === "act") return activity.tool(item.tool, item.risk);
         if (item.kind === "focus") {
-          // Jarvis maximizes/zooms an exhibit; "none" closes. Unknown ref → ignore.
+          // Jarvis maximizes/zooms an exhibit; "none" closes.
           if (item.ref === "none") return lightbox.closeIfAny();
           const card = exhibits.resolveCard(item.turnId, item.ref);
           if (card) lightbox.open(card, item.zoom);
+          else
+            reportFault(
+              "missing-target",
+              `<focus ref="${item.ref}"/> matched no exhibit on the stage`,
+              item.turnId,
+            );
           return;
         }
         return;
@@ -330,6 +439,31 @@ const wire = new Wire({
       case "audio.segment":
         audioMeta.set(msg.streamId, { turnId: msg.turnId });
         return;
+      // the durable record, live: everything Jarvis and its subagents do
+      case "activity":
+        activity.event(msg.event);
+        return;
+      // Layer 2 replay-on-connect: repaint boards + captions + activity so a
+      // refreshed tab converges with the running session. Never carries audio.
+      case "session.replay": {
+        transcript.clear();
+        thoughtLines.clear();
+        currentJarvisLine = null;
+        currentTurnId = null;
+        lightbox.closeIfAny();
+        exhibits.dismiss("", "all");
+        for (const e of msg.activityTail) {
+          if (e.kind === "heard") transcript.addLine("user", e.text);
+          else if (e.kind === "say") transcript.addLine("jarvis", e.text);
+          else if (e.kind === "note" && e.level === "warn") transcript.addLine("warn", e.text);
+        }
+        // re-show under the ORIGINAL turnId:id key — a refreshed tab and a
+        // second tab converge instead of duplicating boards
+        for (const ex of msg.exhibits) exhibits.show(ex.turnId, ex.id, ex.exhibit);
+        activity.reset(msg.activityTail, msg.sessionId);
+        setQuietUI(msg.quiet);
+        return;
+      }
       case "confirm.request": {
         // pending-confirmation card: click always works; spoken yes must
         // exactly match one of msg.phrases (enforced daemon-side)
@@ -365,11 +499,13 @@ const wire = new Wire({
       case "settings":
         settings.populate(msg.settings);
         statusStrip.setSettings(msg.settings);
+        wakeEnabled = msg.settings.wake_enabled;
+        wakeWord = msg.settings.wake_word;
+        wakeUi();
         if (msg.note) toasts.show(msg.note, "info");
         return;
       case "error":
         transcript.addLine("warn", msg.message);
-        activity.note("warn", msg.message);
         toasts.show(msg.message, "error");
         return;
     }
@@ -395,16 +531,28 @@ inputForm.addEventListener("submit", (ev) => {
 
 // ── voice/quiet toggle (quiet = captions only, no TTS audio) ──
 quietToggle.addEventListener("click", () => {
-  quiet = !quiet;
-  const voiceOn = !quiet;
-  quietToggle.classList.toggle("on", voiceOn);
-  quietToggle.setAttribute("aria-pressed", String(voiceOn));
-  quietState.textContent = voiceOn ? "on" : "off";
-  quietIcon.textContent = voiceOn ? "🔊" : "🔇";
-  quietToggle.title = voiceOn
-    ? "Voice on — click for captions only"
-    : "Captions only — click to hear Jarvis speak";
+  setQuietUI(!quiet);
   wire.send({ type: "quiet.set", quiet });
+});
+
+// ── wake toggle: gate on = presence mode (idle speech needs "jarvis…"),
+// gate off = always listening. Server-owned setting; the button just flips it
+// and the settings echo updates every tab.
+const wakeToggle = $<HTMLButtonElement>("#wakeToggle");
+const wakeState = $("#wakeState");
+let wakeEnabled = false;
+let wakeWord = "jarvis";
+
+function wakeUi(): void {
+  wakeToggle.classList.toggle("on", wakeEnabled);
+  wakeToggle.setAttribute("aria-pressed", String(wakeEnabled));
+  wakeState.textContent = wakeEnabled ? "on" : "off";
+  wakeToggle.title = wakeEnabled
+    ? `Wake word on — idle speech needs "${wakeWord}…". Click to always listen.`
+    : "Wake word off — Jarvis listens to everything. Click to require the wake word.";
+}
+wakeToggle.addEventListener("click", () => {
+  wire.send({ type: "settings.set", patch: { wake_enabled: !wakeEnabled } });
 });
 
 // orb: interrupt an active performance, otherwise focus the input

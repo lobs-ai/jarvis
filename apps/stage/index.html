@@ -44,7 +44,10 @@
         <span class="ss-item"><span class="ss-key">thinking</span><span id="ssThinking" class="ss-v">—</span></span>
         <span class="ss-sep"></span>
         <span class="ss-item"><span class="ss-key">wiki</span><span id="ssWiki" class="ss-v">—</span></span>
+        <span class="ss-sep"></span>
+        <span class="ss-item"><span class="ss-key">wake</span><span id="ssWake" class="ss-v">—</span></span>
         <span class="ss-flex"></span>
+        <button id="ssStop" class="ss-stop hidden" type="button" title="Interrupt Jarvis (Esc)">⏹ stop</button>
         <span class="ss-health">
           <span class="ss-h" id="ssEars" title="speech-to-text"><span class="hdot unknown"></span>ears</span>
           <span class="ss-h" id="ssVoice" title="text-to-speech"><span class="hdot unknown"></span>voice</span>
@@ -91,10 +94,24 @@
 
             <!-- activity -->
             <div class="tabpane hidden" data-pane="activity" id="activityPane">
-              <div id="activity"></div>
+              <div class="act-bar">
+                <div class="act-chips">
+                  <button class="chip active" data-f="all" type="button">All</button>
+                  <button class="chip" data-f="tools" type="button">Tools</button>
+                  <button class="chip" data-f="think" type="button">Thinking</button>
+                  <button class="chip" data-f="subagents" type="button">Subagents</button>
+                  <button class="chip" data-f="errors" type="button">Errors</button>
+                </div>
+                <select id="actSession" class="act-session" title="Session">
+                  <option value="live">● live</option>
+                </select>
+                <button id="actWide" class="act-widen" type="button" title="Expand the panel">⤢</button>
+              </div>
+              <div id="activity" data-filter="all"></div>
+              <button id="actJump" class="act-jump hidden" type="button">↓ live</button>
               <div id="activityEmpty" class="empty pane-empty">
-                <p>Jarvis's activity shows here.</p>
-                <p class="empty-sub">Thinking and tool calls, timestamped, turn by turn.</p>
+                <p>Everything Jarvis does shows here.</p>
+                <p class="empty-sub">Speech, thinking, every tool call with its output, and each subagent's step-by-step work — persisted per session.</p>
               </div>
             </div>
 
@@ -156,6 +173,20 @@
               <span id="quietState" class="control-state">on</span>
             </span>
           </button>
+
+          <button
+            id="wakeToggle"
+            class="control"
+            type="button"
+            aria-pressed="false"
+            title="Wake word off — Jarvis listens to everything"
+          >
+            <span class="control-icon">🔔</span>
+            <span class="control-text">
+              <span class="control-label">Wake</span>
+              <span id="wakeState" class="control-state">off</span>
+            </span>
+          </button>
         </div>
       </footer>
 
@@ -196,6 +227,12 @@
             <span class="field-label">Wiki location</span>
             <input id="setWiki" type="text" spellcheck="false" placeholder="/path/to/wiki" />
             <span class="field-hint">The folder Jarvis reads and writes as its notebook.</span>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Wake word</span>
+            <input id="setWake" type="text" spellcheck="false" placeholder="jarvis" />
+            <span class="field-hint">Idle voice input becomes a turn only when it starts with this. Empty disables the gate. Confirmations and barge-in never need it.</span>
           </label>
         </div>
 

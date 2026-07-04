@@ -3,7 +3,19 @@ import type { ToolDef, ToolExecutor } from "./loop.js";
 
 export interface BrainCallbacks {
   onTextDelta: (delta: string) => void; // SPOKEN text (say-tool input, or all text on the stream path)
-  onToolCall?: (name: string) => void;
+  // a tool_use block opened — the input is not known yet (it streams in as
+  // input_json_delta and is complete only at block stop)
+  onToolStart?: (callId: string, name: string) => void;
+  // input complete and parsed: this births the `running` activity event
+  onToolCall?: (callId: string, name: string, input: unknown) => void;
+  // the matching tool_result landed: resolves the open activity event in place
+  onToolResult?: (
+    callId: string,
+    name: string,
+    output: string,
+    isError: boolean,
+    durationMs: number,
+  ) => void;
   // private-workspace text (never spoken) — surfaced as the stage's dim
   // inner-monologue line so silent work is visibly alive
   onThought?: (delta: string) => void;

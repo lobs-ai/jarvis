@@ -21,6 +21,23 @@ const ConfigSchema = z.object({
   tts_voice: z.string().default("default"),
   retention_days: z.number().int().default(30),
   wiki_dir: z.string().default(join(homedir(), "wiki")),
+  // ── post-M4 ──────────────────────────────────────────────────
+  // Idle backstop: a session Rafe walked away from ends itself after this many
+  // minutes of quiet (deferred while background subagents are still working).
+  idle_session_end_min: z.number().default(30),
+  // Layer 3: fire a tier-2 draft task on session end that may PROPOSE (never
+  // commit) wiki edits about Rafe. Flag exists so the feature can be dark-launched.
+  ambient_drafting: z.boolean().default(true),
+  // Layer 4: when the gate is ENABLED, an idle voice utterance becomes a turn
+  // only if it starts with this word ("jarvis" / "hey jarvis"). Confirmations
+  // and barge-in are never gated. The enable/disable switch is separate from
+  // the word (Rafe's call: sometimes just talk, sometimes always-on presence) —
+  // it lives in the stage footer next to Mic/Voice and defaults OFF.
+  wake_word: z.string().default("jarvis"),
+  wake_enabled: z.boolean().default(false),
+  // §II.6: tier-2 subagents get Bash by default (Rafe's call, 2026-07-03) —
+  // observable via Activity, stoppable in one click. Off reverts to read-only.
+  subagent_bash: z.boolean().default(true),
 });
 export type Config = z.infer<typeof ConfigSchema>;
 

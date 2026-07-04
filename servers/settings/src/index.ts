@@ -18,7 +18,8 @@ const server = new McpServer({ name: "jarvis-settings", version: "0.1.0" });
 
 server.tool(
   "settings_get",
-  "Read Jarvis's current settings: wiki_dir, model_tier1, model_tier2, thinking, thinking_tier2.",
+  "Read Jarvis's current settings: wiki_dir, model_tier1, model_tier2, thinking, " +
+    "thinking_tier2, wake_word, wake_enabled.",
   {},
   async () => {
     try {
@@ -47,6 +48,14 @@ server.tool(
       .enum(["off", "low", "medium", "high", "xhigh", "max"])
       .optional()
       .describe("background-worker thinking effort (applies live)"),
+    wake_word: z.string().optional().describe("the wake word itself (applies live)"),
+    wake_enabled: z
+      .boolean()
+      .optional()
+      .describe(
+        "wake-word gate on/off (applies live). On: idle speech needs the wake word. " +
+          "Off: Jarvis listens to everything. Rafe toggles this by voice — do it when asked.",
+      ),
   },
   async (patch) => {
     try {

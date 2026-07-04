@@ -128,8 +128,9 @@ export class McpManager {
   }
 }
 
-// Accident net, not a guarantee (design §Security model).
-function redactSecrets(text: string): string {
+// Accident net, not a guarantee (design §Security model). Exported: captured
+// tool outputs in the durable activity log run the same net as bundle egress.
+export function redactSecrets(text: string): string {
   return text
     .replace(/\b(sk-[a-zA-Z0-9-_]{20,})/g, "[redacted-key]")
     .replace(/\b(gh[pousr]_[a-zA-Z0-9]{20,})/g, "[redacted-token]")

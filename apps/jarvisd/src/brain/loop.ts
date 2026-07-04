@@ -16,7 +16,15 @@ export interface ToolExecutor {
 
 export interface TurnCallbacks {
   onTextDelta: (delta: string) => void;
-  onToolCall?: (name: string) => void;
+  onToolStart?: (callId: string, name: string) => void;
+  onToolCall?: (callId: string, name: string, input: unknown) => void;
+  onToolResult?: (
+    callId: string,
+    name: string,
+    output: string,
+    isError: boolean,
+    durationMs: number,
+  ) => void;
 }
 
 export interface TurnResult {
@@ -103,13 +111,18 @@ export async function runTurn(opts: {
     const results: Anthropic.ToolResultBlockParam[] = [];
     for (const block of finalMessage.content) {
       if (block.type !== "tool_use") continue;
-      callbacks.onToolCall?.(block.name);
+      callbacks.onToolStart?.(block.id, block.name);
+      callbacks.onToolCall?.(block.id, block.name, block.input);
+      const t0 = Date.now();
       let output: string;
+      let isError = false;
       try {
         output = await execute(block.name, block.input as Record<string, unknown>);
       } catch (err) {
         output = `tool error: ${String(err)}`;
+        isError = true;
       }
+      callbacks.onToolResult?.(block.id, block.name, output, isError, Date.now() - t0);
       results.push({ type: "tool_result", tool_use_id: block.id, content: output });
     }
     messages.push({ role: "user", content: results });

@@ -4,6 +4,7 @@ import {
   ClientMessage,
   encodeBinaryFrame,
   decodeBinaryFrame,
+  type ActivityEvent,
   type ServerMessage,
   type PerformanceItem,
   type SettingsPatch,
@@ -47,6 +48,10 @@ export class StageSocket implements SessionSink {
       // when it equals lastOrb (which the broadcast dedupe would swallow), so
       // this goes straight to the new socket and bypasses sendState's dedupe.
       this.sendTo(ws, { type: "state", orb: this.lastOrb ?? "idle" });
+      // Layer 2 replay-on-connect: repaint the conversation-so-far (live
+      // exhibits + activity tail) on the NEW socket only — the broadcast bus
+      // already keeps everyone else current, and replay never carries audio.
+      if (this.session) this.sendTo(ws, this.session.replaySnapshot());
       this.onConnect?.(); // main pushes a settings snapshot; broadcasting it is fine
     });
   }
@@ -117,6 +122,15 @@ export class StageSocket implements SessionSink {
       case "settings.set":
         this.onSettingsSet?.(msg.patch);
         break;
+      case "subagent.send":
+        this.onSubagentSend?.(msg.id, msg.message);
+        break;
+      case "subagent.stop":
+        this.onSubagentStop?.(msg.id);
+        break;
+      case "stage.fault":
+        session.reportStageFault(msg.kind, msg.detail, msg.turnId);
+        break;
     }
   }
 
@@ -127,6 +141,9 @@ export class StageSocket implements SessionSink {
   onSessionNew: (() => void) | null = null;
   onSettingsGet: (() => void) | null = null;
   onSettingsSet: ((patch: SettingsPatch) => void) | null = null;
+  // human-facing subagent controls from the activity panel (§II.5)
+  onSubagentSend: ((id: string, message: string) => void) | null = null;
+  onSubagentStop: ((id: string) => void) | null = null;
 
   private broadcast(msg: ServerMessage): void {
     const data = JSON.stringify(msg);
@@ -192,6 +209,17 @@ export class StageSocket implements SessionSink {
 
   sendThought(turnId: string, text: string): void {
     this.broadcast({ type: "thought", turnId, text });
+  }
+
+  sendActivity(event: ActivityEvent): void {
+    this.broadcast({ type: "activity", event });
+  }
+
+  hasAudience(): boolean {
+    for (const ws of this.sockets) {
+      if (ws.readyState === WebSocket.OPEN) return true;
+    }
+    return false;
   }
 
   sendConfirmRequest(

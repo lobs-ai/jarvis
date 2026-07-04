@@ -5,7 +5,7 @@ import { join, extname, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import Anthropic from "@anthropic-ai/sdk";
 import { WhisperStt, ChatterboxTts } from "@jarvis/voice";
-import { SettingsPatch, type SettingsSnapshot } from "@jarvis/protocol";
+import { SettingsPatch, type ActivityDraft, type SettingsSnapshot } from "@jarvis/protocol";
 import { loadConfig, saveConfig, JARVIS_HOME } from "./config.js";
 import { MemoryStore } from "./memory/store.js";
 import { Session } from "./session.js";
@@ -13,7 +13,8 @@ import { StageSocket } from "./ws.js";
 import { McpManager, riskOf, type McpServerSpec } from "./mcp/manager.js";
 import { ConfirmBroker } from "./mcp/confirm.js";
 import { BackgroundRunner, type BackgroundReport } from "./brain/tasks.js";
-import { CliBackground } from "./brain/bg-cli.js";
+import { SubagentManager, type SubagentReport } from "./subagents/manager.js";
+import { buildAmbientDraftTask, distillTranscript, hasSubstance } from "./brain/ambient-draft.js";
 import type { ToolDef } from "./brain/loop.js";
 import type { BrainPort } from "./brain/port.js";
 import { ApiBrain } from "./brain/api-brain.js";
@@ -43,7 +44,13 @@ const CLI_ALLOWED = [
   // control endpoint, so the stage sees every change immediately)
   "mcp__settings__settings_get",
   "mcp__settings__settings_set",
-  // hand long work to the tier-2 worker (routes through jarvisd's /tasks)
+  // interactive tier-2 subagents (§II.5) — all thin proxies to /subagents;
+  // dispatch_background is kept as an alias of subagent_start
+  "mcp__tasks__subagent_start",
+  "mcp__tasks__subagent_send",
+  "mcp__tasks__subagent_status",
+  "mcp__tasks__subagent_result",
+  "mcp__tasks__subagent_stop",
   "mcp__tasks__dispatch_background",
 ];
 const CLI_DISALLOWED = [
@@ -83,7 +90,8 @@ const MIME: Record<string, string> = {
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
-  const store = new MemoryStore(cfg.retention_days);
+  const idleSessionEndMs = cfg.idle_session_end_min * 60_000;
+  const store = new MemoryStore(cfg.retention_days, idleSessionEndMs);
   const sock = new StageSocket();
 
   const confirm = new ConfirmBroker(
@@ -125,7 +133,8 @@ async function main(): Promise<void> {
   // Brain selection: prefer Rafe's Claude Code subscription (CliBrain); fall
   // back to the Anthropic SDK only if the CLI is unavailable or JARVIS_BRAIN=api.
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  const useCli = process.env.JARVIS_BRAIN !== "api" && hasClaudeCli();
+  const cliAvailable = hasClaudeCli();
+  const useCli = process.env.JARVIS_BRAIN !== "api" && cliAvailable;
 
   // Proposal gate (subscription path): Claude may PROPOSE wiki edits but not
   // commit — jarvisd shows the diff, confirms, and commits via its own MCP
@@ -154,7 +163,6 @@ async function main(): Promise<void> {
       servers: cliServers,
       allowedTools: CLI_ALLOWED,
       disallowedTools: CLI_DISALLOWED,
-      onToolCall: () => {},
       onToolResult: gateProposal,
       facts: () => store.readFacts(),
     });
@@ -177,8 +185,16 @@ async function main(): Promise<void> {
   const session = new Session(brain, sock, store, null, null);
   sock.bind(session);
   session.attachMcp(mcp, confirm);
+  // the gate applies only while enabled — the word survives toggling off
+  session.getWakeWord = () => (cfg.wake_enabled ? cfg.wake_word : "");
 
-  // ── Tier-2 background pipeline (both brain paths) ──────────────
+  // Single appender for activity that originates OUTSIDE the session (subagent
+  // fan-out): stamp via the store, broadcast the exact on-disk record.
+  const emitActivity = (draft: ActivityDraft): void => {
+    sock.sendActivity(store.append(draft));
+  };
+
+  // ── Tier-2 background pipeline ─────────────────────────────────
   // Reports announce when the room goes idle; staged wiki edits then walk
   // through the same confirm→gated-commit flow as tier-1 proposals, one diff
   // at a time. Proposals persist on disk (~/.jarvis/proposals), so a worker
@@ -201,16 +217,74 @@ async function main(): Promise<void> {
       session.announceWhenIdle("Committed a background wiki edit.", res);
     }
   };
-  const onBackgroundDone = (report: BackgroundReport): void => {
-    const summary =
-      report.report.length > 400 ? report.report.slice(0, 400) + "…" : report.report;
-    const proposalNote = report.proposals.length
-      ? ` I staged ${report.proposals.length} wiki edit(s) for you to review.`
+
+  const AMBIENT_LABEL = "ambient wiki draft";
+  const onSubagentReport = (r: SubagentReport): void => {
+    // An ambient draft that found nothing stays silent — proposals are the only
+    // thing worth interrupting the room for, and even those wait for idle.
+    if (r.label === AMBIENT_LABEL && r.proposals.length === 0) return;
+    const summary = r.report.length > 400 ? r.report.slice(0, 400) + "…" : r.report;
+    const proposalNote = r.proposals.length
+      ? ` I staged ${r.proposals.length} wiki edit(s) for you to review.`
       : "";
-    session.announceWhenIdle(`Finished "${report.task.slice(0, 60)}".${proposalNote}`, summary);
-    if (report.proposals.length) void reviewProposals(report.proposals);
+    const who = r.label !== r.subId ? `"${r.label}" (${r.subId})` : r.subId;
+    session.announceWhenIdle(`${who} finished.${proposalNote}`, summary);
+    // notification, never interruption: the tier-1 model learns on its NEXT turn
+    session.noteForNextTurn(`background subagent ${r.subId} finished: ${summary.slice(0, 300)}`);
+    if (r.proposals.length) void reviewProposals(r.proposals);
   };
-  let dispatchBackground: ((task: string) => string) | null = null;
+
+  // Interactive subagents need the claude CLI (they ARE persistent claude
+  // children); the SDK BackgroundRunner remains only as the API-path fallback.
+  let subagents: SubagentManager | null = null;
+  let dispatchBackground: ((task: string, label?: string) => string) | null = null;
+  if (cliAvailable) {
+    subagents = new SubagentManager({
+      model: () => cfg.model_tier2,
+      thinking: () => cfg.thinking_tier2,
+      bashAllowed: () => cfg.subagent_bash && process.env.SUBAGENT_BASH !== "off",
+      servers: cliServers.filter((s) => s.name === "wiki"),
+      emit: emitActivity,
+      onReport: onSubagentReport,
+    });
+    dispatchBackground = (task, label) =>
+      subagents!.start(task, label, {
+        session: session.sessionId,
+        parentTurn: session.activeTurnId,
+      });
+    sock.onSubagentSend = (id, message) => {
+      try {
+        subagents!.send(id, message);
+      } catch (err) {
+        sock.sendWarning(String(err));
+      }
+    };
+    sock.onSubagentStop = (id) => {
+      try {
+        subagents!.stop(id);
+      } catch (err) {
+        sock.sendWarning(String(err));
+      }
+    };
+  }
+
+  // ── Session lifecycle (Layer 1 + 3) ───────────────────────────
+  session.onSessionEnd = (closedId) => {
+    brainRestartPending = false; // the reset already delivered any pending change
+    if (!cfg.ambient_drafting || !subagents) return;
+    const events = store.readSession(closedId);
+    if (!hasSubstance(events)) return;
+    try {
+      subagents.start(buildAmbientDraftTask(distillTranscript(events)), AMBIENT_LABEL, {
+        session: closedId,
+      });
+      console.log(`[ambient] draft task dispatched over session ${closedId}`);
+    } catch (err) {
+      console.error(`[ambient] draft dispatch skipped: ${String(err)}`);
+    }
+  };
+  // Idle backstop: defers while THIS session's subagents are still working (§7).
+  session.startIdleBackstop(idleSessionEndMs, () => subagents?.hasBusy(session.sessionId) ?? false);
 
   // ── Settings control plane ─────────────────────────────────────
   // jarvisd is the single writer: the stage panel (WS), the settings MCP
@@ -224,14 +298,14 @@ async function main(): Promise<void> {
     model_tier2: cfg.model_tier2,
     thinking: cfg.thinking,
     thinking_tier2: cfg.thinking_tier2,
+    wake_word: cfg.wake_word,
+    wake_enabled: cfg.wake_enabled,
   });
 
   let brainRestartPending = false;
-  const restartBrain = (): void => {
-    brain.reset?.();
-    brain.warm?.(); // respawn immediately so the next turn doesn't race MCP startup
-    sock.sendSessionReset();
-  };
+  // A brain restart is a session end (Layer 1): the durable transcript closes
+  // and rotates with the conversation, so replay never resurrects a cleared room.
+  const restartBrain = (): void => session.endSession("button");
   session.onIdle = () => {
     if (!brainRestartPending) return;
     brainRestartPending = false;
@@ -252,10 +326,21 @@ async function main(): Promise<void> {
       cfg.model_tier2 = patch.model_tier2;
       notes.push(`tier-2 → ${patch.model_tier2}`);
     }
-    // tier-2 knobs apply live: every background task is a fresh child
+    // tier-2 knobs bind the NEXT subagent_start; running subagents keep their
+    // spawn-time model until they close (§II.8)
     if (patch.thinking_tier2 && patch.thinking_tier2 !== cfg.thinking_tier2) {
       cfg.thinking_tier2 = patch.thinking_tier2;
       notes.push(`tier-2 thinking → ${patch.thinking_tier2}`);
+    }
+    if (patch.wake_word !== undefined && patch.wake_word !== cfg.wake_word) {
+      cfg.wake_word = patch.wake_word;
+      notes.push(patch.wake_word ? `wake word → "${patch.wake_word}"` : "wake word cleared");
+    }
+    if (patch.wake_enabled !== undefined && patch.wake_enabled !== cfg.wake_enabled) {
+      cfg.wake_enabled = patch.wake_enabled;
+      notes.push(
+        patch.wake_enabled ? `wake word on — say "${cfg.wake_word}…"` : "wake word off — always listening",
+      );
     }
     if (
       (patch.model_tier1 && patch.model_tier1 !== cfg.model_tier1) ||
@@ -290,12 +375,9 @@ async function main(): Promise<void> {
       sock.sendWarning(`settings rejected: ${String(err)}`);
     }
   };
-  sock.onSessionNew = () => {
-    session.resetConversation();
-    brain.warm?.();
-    brainRestartPending = false; // the reset already delivered any pending change
-    sock.sendSessionReset();
-  };
+  // The button, the spoken phrase, and the idle backstop all route through one
+  // endSession(), so ambient drafts fire exactly once however a session ends.
+  sock.onSessionNew = () => session.endSession("button");
 
   // Voice ports: degrade gracefully if a sidecar is down (captions carry the turn).
   const stt = new WhisperStt(cfg.stt_url);
@@ -321,9 +403,16 @@ async function main(): Promise<void> {
   // model's tools + tier-2 + built-ins.
   if (client) {
     // ── Anthropic SDK path: jarvisd owns tool execution ──────────────
+    const onBackgroundDone = (report: BackgroundReport): void =>
+      onSubagentReport({
+        subId: report.taskId,
+        label: report.taskId,
+        instruction: report.task,
+        report: report.report,
+        proposals: report.proposals,
+      });
     const bg = new BackgroundRunner(client, cfg.model_tier2, servers, onBackgroundDone);
-    dispatchBackground = (task) => bg.dispatch(task);
-    session.setBackgroundDispatch(dispatchBackground);
+    if (!dispatchBackground) dispatchBackground = (task) => bg.dispatch(task);
 
     const BUILTIN_TOOLS: ToolDef[] = [
       {
@@ -351,7 +440,7 @@ async function main(): Promise<void> {
     const refreshTools = (): void => {
       session.setTools([...BUILTIN_TOOLS, ...mcp.tools()], async (name, input) => {
         if (name === "dispatch_background") {
-          const id = bg.dispatch(String(input.task ?? ""));
+          const id = dispatchBackground!(String(input.task ?? ""));
           return `dispatched as ${id}; tell Rafe you'll report back when it's done.`;
         }
         if (name === "remember_fact") {
@@ -373,24 +462,29 @@ async function main(): Promise<void> {
     refreshTools();
   } else {
     // ── Subscription path: Claude Code calls MCP directly; jarvisd's own
-    // connections are only for bundle context + the gated commit. Tier-2 is
-    // a detached one-shot claude run per task (opus + xhigh — deliberation is
-    // free off the voice path), dispatched via the tasks MCP server → /tasks.
+    // connections are only for bundle context + the gated commit. Tier-2 rides
+    // the SubagentManager (persistent children) wired above.
     void mcp.connectAll(servers);
-    const bgCli = new CliBackground({
-      model: () => cfg.model_tier2,
-      thinking: () => cfg.thinking_tier2,
-      servers: cliServers.filter((s) => s.name === "wiki"),
-      onDone: onBackgroundDone,
-    });
-    dispatchBackground = (task) => bgCli.dispatch(task);
   }
 
   const server = createServer((req, res) => {
     const url = (req.url ?? "/").split("?")[0]!;
+    const text = (status: number, body: string): void => {
+      res.writeHead(status, { "content-type": "text/plain; charset=utf-8" });
+      res.end(body);
+    };
+    const json = (status: number, body: unknown): void => {
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+    const readBody = (cb: (body: string) => void): void => {
+      let body = "";
+      req.on("data", (c: Buffer) => (body += c.toString()));
+      req.on("end", () => cb(body));
+    };
+
     if (url === "/healthz") {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
+      json(200, { ok: true });
       return;
     }
     // Settings control endpoint (localhost-only): GET reads, POST applies a
@@ -398,66 +492,137 @@ async function main(): Promise<void> {
     // through the same single writer as the stage panel.
     if (url === "/settings") {
       if (req.method === "GET") {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(currentSettings()));
+        json(200, currentSettings());
         return;
       }
       if (req.method === "POST") {
-        let body = "";
-        req.on("data", (c: Buffer) => (body += c.toString()));
-        req.on("end", () => {
+        readBody((body) => {
           try {
-            const result = applySettings(JSON.parse(body || "{}"));
-            res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify(result));
+            json(200, applySettings(JSON.parse(body || "{}")));
           } catch (err) {
-            res.writeHead(400, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: String(err) }));
+            json(400, { error: String(err) });
           }
         });
         return;
       }
-      res.writeHead(405);
-      res.end("GET or POST");
+      text(405, "GET or POST");
       return;
     }
-    // Background dispatch (localhost-only): the tasks MCP server rides this,
-    // so tier-1's dispatch_background lands on jarvisd's own worker.
+    // ── Interactive subagents control endpoint (§II.5). The tasks MCP server
+    // and the stage's activity panel both ride this; jarvisd stays the single
+    // owner of the pool. /tasks below remains an alias of "start".
+    const subMatch = url.match(/^\/subagents(?:\/([\w-]+)(?:\/(\w+))?)?$/);
+    if (subMatch) {
+      const [, id, verb] = subMatch;
+      if (!subagents) {
+        text(503, "subagents unavailable: the claude CLI is not installed");
+        return;
+      }
+      try {
+        if (!id) {
+          if (req.method === "GET") {
+            text(200, subagents.status());
+            return;
+          }
+          if (req.method === "POST") {
+            readBody((body) => {
+              try {
+                const parsed = JSON.parse(body || "{}") as { task?: unknown; label?: unknown };
+                const task = String(parsed.task ?? "").trim();
+                if (!task) throw new Error("missing task");
+                const label = parsed.label ? String(parsed.label) : undefined;
+                const subId = subagents!.start(task, label, {
+                  session: session.sessionId,
+                  parentTurn: session.activeTurnId,
+                });
+                text(
+                  200,
+                  `started ${subId} (${cfg.model_tier2}, thinking ${cfg.thinking_tier2}) — it runs in the ` +
+                    `background; message it with subagent_send, check subagent_status, and the report ` +
+                    `will arrive in the conversation when it finishes. Tell Rafe it's running.`,
+                );
+              } catch (err) {
+                text(400, String(err instanceof Error ? err.message : err));
+              }
+            });
+            return;
+          }
+          text(405, "GET or POST");
+          return;
+        }
+        if (!verb && req.method === "GET") {
+          text(200, subagents.status(id));
+          return;
+        }
+        if (verb === "result" && req.method === "GET") {
+          text(200, subagents.result(id));
+          return;
+        }
+        if (verb === "send" && req.method === "POST") {
+          readBody((body) => {
+            try {
+              const message = String((JSON.parse(body || "{}") as { message?: unknown }).message ?? "").trim();
+              if (!message) throw new Error("missing message");
+              text(200, subagents!.send(id, message));
+            } catch (err) {
+              text(400, String(err instanceof Error ? err.message : err));
+            }
+          });
+          return;
+        }
+        if (verb === "stop" && req.method === "POST") {
+          text(200, subagents.stop(id));
+          return;
+        }
+        text(404, "unknown subagent verb");
+      } catch (err) {
+        text(400, String(err instanceof Error ? err.message : err));
+      }
+      return;
+    }
+    // Background dispatch (kept as an alias of subagent start so existing
+    // prompt text and the dispatch_background tool keep working).
     if (url === "/tasks" && req.method === "POST") {
-      let body = "";
-      req.on("data", (c: Buffer) => (body += c.toString()));
-      req.on("end", () => {
+      readBody((body) => {
         try {
           const task = String((JSON.parse(body || "{}") as { task?: unknown }).task ?? "").trim();
           if (!task) throw new Error("missing task");
           if (!dispatchBackground) throw new Error("no background worker available");
           const id = dispatchBackground(task);
-          res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-          res.end(
+          text(
+            200,
             `dispatched as ${id} (${cfg.model_tier2}, thinking ${cfg.thinking_tier2}) — ` +
               `the report will arrive in the conversation when it finishes; tell Rafe it's running.`,
           );
         } catch (err) {
-          res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
-          res.end(String(err));
+          text(400, String(err instanceof Error ? err.message : err));
         }
       });
+      return;
+    }
+    // ── Activity read endpoints (§II.9): the stage's session picker.
+    if (url === "/sessions") {
+      json(200, store.listSessions());
+      return;
+    }
+    if (url === "/activity") {
+      const params = new URL(req.url ?? "", "http://x").searchParams;
+      const id = params.get("session") ?? store.sessionId;
+      const limit = Math.min(Number(params.get("limit")) || 1000, 5000);
+      json(200, store.readSession(id).slice(-limit));
       return;
     }
     // Health for the stage's status strip: live sidecar probes, cheap enough
     // for a 10s poll from a handful of tabs.
     if (url === "/status") {
       void Promise.all([stt.healthy(), tts.healthy()]).then(([sttUp, ttsUp]) => {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(
-          JSON.stringify({
-            stt: sttUp,
-            tts: ttsUp,
-            brain: brain.kind,
-            active: session.isActive(),
-            uptime_s: Math.round(process.uptime()),
-          }),
-        );
+        json(200, {
+          stt: sttUp,
+          tts: ttsUp,
+          brain: brain.kind,
+          active: session.isActive(),
+          uptime_s: Math.round(process.uptime()),
+        });
       });
       return;
     }
@@ -465,33 +630,20 @@ async function main(): Promise<void> {
     // wiki MCP server, which resolves wiki_dir live from config.
     if (url === "/wiki/pages") {
       void mcp.execute("wiki_list", {}).then(
-        (text) => {
-          res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-          res.end(text);
-        },
-        (err) => {
-          res.writeHead(500);
-          res.end(String(err));
-        },
+        (t) => text(200, t),
+        (err) => text(500, String(err)),
       );
       return;
     }
     if (url === "/wiki/search") {
       const q = new URL(req.url ?? "", "http://x").searchParams.get("q") ?? "";
       if (!q.trim()) {
-        res.writeHead(400);
-        res.end("missing q");
+        text(400, "missing q");
         return;
       }
       void mcp.execute("wiki_search", { query: q }).then(
-        (text) => {
-          res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-          res.end(text);
-        },
-        (err) => {
-          res.writeHead(500);
-          res.end(String(err));
-        },
+        (t) => text(200, t),
+        (err) => text(500, String(err)),
       );
       return;
     }
@@ -506,8 +658,7 @@ async function main(): Promise<void> {
       if (fileMatch) {
         const path = normalize(join(REPO_ROOT, fileMatch[1]!));
         if (!path.startsWith(REPO_ROOT) || !existsSync(path)) {
-          res.writeHead(404);
-          res.end(`no such repo file: ${fileMatch[1]!}`);
+          text(404, `no such repo file: ${fileMatch[1]!}`);
           return;
         }
         res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
@@ -516,38 +667,31 @@ async function main(): Promise<void> {
       }
       const m = uri.match(/^wiki:(.+)$/);
       if (!m) {
-        res.writeHead(404);
-        res.end(`unresolvable ref scheme: ${uri}`);
+        text(404, `unresolvable ref scheme: ${uri}`);
         return;
       }
       void mcp
         .execute("wiki_read", { path: m[1]! })
-        .then((text) => {
-          if (text.startsWith("tool error") || text.startsWith("tool unavailable") || text.startsWith("no such page")) {
-            res.writeHead(404);
-            res.end(text.slice(0, 500));
+        .then((t) => {
+          if (t.startsWith("tool error") || t.startsWith("tool unavailable") || t.startsWith("no such page")) {
+            text(404, t.slice(0, 500));
             return;
           }
           // strip the "# path (base-hash …)" header wiki_read prepends (paths
           // may contain spaces) and YAML frontmatter — neither is content
-          const body = text
+          const body = t
             .replace(/^# .+? \(base-hash \w+\)\n\n/, "")
             .replace(/^---\n[\s\S]*?\n---\n+/, "");
-          res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-          res.end(body);
+          text(200, body);
         })
-        .catch((err) => {
-          res.writeHead(500);
-          res.end(String(err));
-        });
+        .catch((err) => text(500, String(err)));
       return;
     }
     // Static stage. COOP/COEP: the Silero VAD worker needs cross-origin isolation.
     const rel = url === "/" ? "/index.html" : url;
     const path = normalize(join(STAGE_DIST, rel));
     if (!path.startsWith(STAGE_DIST) || !existsSync(path)) {
-      res.writeHead(404);
-      res.end("not found (did you build the stage? bin/jarvis start --build)");
+      text(404, "not found (did you build the stage? bin/jarvis start --build)");
       return;
     }
     res.writeHead(200, {
@@ -562,7 +706,7 @@ async function main(): Promise<void> {
   sock.attach(server);
   server.listen(cfg.port, "127.0.0.1", () => {
     console.log(`jarvisd listening on http://127.0.0.1:${cfg.port} (stage + /ws)`);
-    console.log(`tier-1 model: ${cfg.model_tier1}`);
+    console.log(`tier-1 model: ${cfg.model_tier1} · session ${store.sessionId}`);
   });
 }
 

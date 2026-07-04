@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { PerformanceItem } from "./performance.js";
+import { ActivityEvent, LiveExhibit } from "./activity.js";
 
 // Runtime-adjustable settings, shared by the stage UI, jarvisd's HTTP control
 // endpoints, and the settings MCP server — one schema, one writer (jarvisd).
@@ -14,6 +15,10 @@ export const SettingsPatch = z.object({
   model_tier2: z.string().min(1).optional(),
   thinking: ThinkingLevel.optional(),
   thinking_tier2: ThinkingLevel.optional(),
+  // wake word for presence mode + its quick on/off switch (the stage footer
+  // control flips wake_enabled; the word itself is set in the drawer)
+  wake_word: z.string().optional(),
+  wake_enabled: z.boolean().optional(),
 });
 export type SettingsPatch = z.infer<typeof SettingsPatch>;
 
@@ -23,6 +28,8 @@ export const SettingsSnapshot = z.object({
   model_tier2: z.string(),
   thinking: ThinkingLevel,
   thinking_tier2: ThinkingLevel,
+  wake_word: z.string(),
+  wake_enabled: z.boolean(),
 });
 export type SettingsSnapshot = z.infer<typeof SettingsSnapshot>;
 
@@ -45,6 +52,18 @@ export const ClientMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("session.new") }),
   z.object({ type: z.literal("settings.get") }),
   z.object({ type: z.literal("settings.set"), patch: SettingsPatch }),
+  // human-facing subagent controls from the activity panel (design §II.5)
+  z.object({ type: z.literal("subagent.send"), id: z.string(), message: z.string().min(1) }),
+  z.object({ type: z.literal("subagent.stop"), id: z.string() }),
+  // the stage noticed a performance failure (exhibit didn't resolve, audio
+  // couldn't play, a directive targeted nothing) — jarvisd folds these into a
+  // corrective system turn so the model can fix its own show unprompted
+  z.object({
+    type: z.literal("stage.fault"),
+    kind: z.enum(["exhibit-unresolved", "missing-target", "audio-blocked", "audio-error"]),
+    detail: z.string().min(1).max(400),
+    turnId: z.string().optional(),
+  }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
 
@@ -61,7 +80,12 @@ export type OrbState = z.infer<typeof OrbState>;
 // jarvisd → stage
 export const ServerMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("state"), orb: OrbState }),
-  z.object({ type: z.literal("turn.begin"), turnId: z.string(), source: z.enum(["voice", "text"]) }),
+  // "system" = a turn jarvisd itself initiated (stage-fault correction)
+  z.object({
+    type: z.literal("turn.begin"),
+    turnId: z.string(),
+    source: z.enum(["voice", "text", "system"]),
+  }),
   z.object({ type: z.literal("turn.end"), turnId: z.string() }),
   // live transcript of what STT heard (caption rail shows user side too)
   z.object({ type: z.literal("heard"), turnId: z.string(), text: z.string() }),
@@ -92,6 +116,18 @@ export const ServerMessage = z.discriminatedUnion("type", [
   // current settings; pushed on connect and after every change, whoever made it
   // (stage panel, HTTP, or Jarvis itself through the settings MCP server)
   z.object({ type: z.literal("settings"), settings: SettingsSnapshot, note: z.string().optional() }),
+  // one durable activity event, live (the on-disk record IS the wire payload)
+  z.object({ type: z.literal("activity"), event: ActivityEvent }),
+  // replay-on-connect (Layer 2): pushed to the NEW socket only. Live exhibits
+  // of completed turns (the in-flight turn arrives via the normal stream) plus
+  // a bounded activity tail for caption/activity backfill. Never carries audio.
+  z.object({
+    type: z.literal("session.replay"),
+    sessionId: z.string(),
+    exhibits: z.array(LiveExhibit),
+    activityTail: z.array(ActivityEvent),
+    quiet: z.boolean(),
+  }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessage>;
 

@@ -12,6 +12,13 @@ export class Exhibits {
     // about to be replaced/swept away (so it lands back in the grid, not the overlay)
     private readonly onMaximize?: (card: HTMLElement) => void,
     private readonly onEvict?: (card: HTMLElement) => void,
+    // something the model asked for didn't land on screen — feeds the
+    // stage-fault loop so the model can repair its own show
+    private readonly onFault?: (
+      kind: "exhibit-unresolved" | "missing-target",
+      detail: string,
+      turnId: string,
+    ) => void,
   ) {}
 
   show(turnId: string, id: string, exhibit: Exhibit): void {
@@ -41,7 +48,7 @@ export class Exhibits {
     body.addEventListener("click", () => {
       if (!card.classList.contains("in-lightbox")) this.onMaximize?.(card);
     });
-    this.render(body, exhibit);
+    this.render(body, exhibit, turnId);
 
     card.append(header, body);
     this.root.appendChild(card);
@@ -51,7 +58,10 @@ export class Exhibits {
 
   update(turnId: string, ref: string, bodyText: string): void {
     const card = this.find(turnId, ref);
-    if (!card) return;
+    if (!card) {
+      this.onFault?.("missing-target", `<update ref="${ref}"/> matched no exhibit on the stage`, turnId);
+      return;
+    }
     const body = card.querySelector<HTMLElement>(".body");
     if (!body) return;
     const type = card.querySelector(".etype")?.textContent ?? "markdown";
@@ -68,6 +78,8 @@ export class Exhibits {
     if (card) {
       this.byKey.delete(card.dataset.key!);
       this.sweep(card);
+    } else {
+      this.onFault?.("missing-target", `<dismiss ref="${ref}"/> matched no exhibit on the stage`, turnId);
     }
   }
 
@@ -92,7 +104,7 @@ export class Exhibits {
     card.addEventListener("animationend", () => card.remove(), { once: true });
   }
 
-  private render(body: HTMLElement, exhibit: Exhibit): void {
+  private render(body: HTMLElement, exhibit: Exhibit, turnId?: string): void {
     const content = "body" in exhibit ? exhibit.body : undefined;
     // by-reference exhibits resolve through jarvisd's /ref endpoint
     if (!content && exhibit.type !== "image" && exhibit.ref) {
@@ -103,7 +115,16 @@ export class Exhibits {
           const text = await res.text();
           this.renderContent(body, exhibit.type, text);
         })
-        .catch(() => this.placeholder(body, exhibit.ref));
+        .catch((err: unknown) => {
+          this.placeholder(body, exhibit.ref);
+          if (turnId) {
+            this.onFault?.(
+              "exhibit-unresolved",
+              `exhibit "${exhibit.title ?? "untitled"}" ref ${exhibit.ref} failed to render: ${String(err).slice(0, 160)}`,
+              turnId,
+            );
+          }
+        });
       return;
     }
     switch (exhibit.type) {

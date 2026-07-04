@@ -20,6 +20,7 @@ export class Settings {
   private model2 = $<HTMLSelectElement>("#setModel2");
   private thinking2 = $<HTMLSelectElement>("#setThinking2");
   private wiki = $<HTMLInputElement>("#setWiki");
+  private wake = $<HTMLInputElement>("#setWake");
   private apply = $<HTMLButtonElement>("#setApply");
   private snapshot: SettingsSnapshot | null = null;
 
@@ -31,7 +32,7 @@ export class Settings {
     this.toggleBtn.addEventListener("click", () => this.toggle());
     this.closeBtn.addEventListener("click", () => this.close());
     this.scrim.addEventListener("click", () => this.close());
-    for (const el of [this.model, this.thinking, this.model2, this.thinking2, this.wiki]) {
+    for (const el of [this.model, this.thinking, this.model2, this.thinking2, this.wiki, this.wake]) {
       el.addEventListener("input", () => this.refreshDirty());
       el.addEventListener("change", () => this.refreshDirty());
     }
@@ -54,6 +55,7 @@ export class Settings {
     this.model2.value = s.model_tier2;
     this.thinking2.value = s.thinking_tier2;
     this.wiki.value = s.wiki_dir;
+    this.wake.value = s.wake_word;
     this.refreshDirty();
   }
 
@@ -90,6 +92,9 @@ export class Settings {
       patch.thinking_tier2 = this.thinking2.value as SettingsPatch["thinking_tier2"];
     const wiki = this.wiki.value.trim();
     if (wiki && wiki !== s.wiki_dir) patch.wiki_dir = wiki;
+    // empty is meaningful here: it disables the wake-word gate entirely
+    const wake = this.wake.value.trim();
+    if (wake !== s.wake_word) patch.wake_word = wake;
     return patch;
   }
 
