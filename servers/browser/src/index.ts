@@ -1,7 +1,11 @@
 // jarvis browser server — read and act use different mechanisms ON PURPOSE
 // (design §Security model):
-//   EYES  read Rafe's real Chrome via AppleScript (frontmost tab; read-only;
-//         no debug port on the daily browser).
+//   EYES  read Rafe's real Chrome via AppleScript. Two tiers:
+//           ROSTER — title+url of every tab across every window (cheap).
+//           DEEP   — active tab's selection + visible text.
+//         Read-only; no debug port on the daily browser. Drill-down into
+//         another tab needs no tool: the brain has a shell and can AppleScript
+//         a specific tab itself.
 //   HANDS act via CDP against a dedicated Jarvis-owned Chrome profile
 //         (bin/jarvis chrome, :9222) — injection can't reach logged-in sessions.
 
@@ -13,6 +17,8 @@ import { z } from "zod";
 
 const CDP_URL = process.env.JARVIS_CDP_URL ?? "http://127.0.0.1:9222";
 const TEXT_LIMIT = 4000;
+const TAB_CAP = 40; // tabs listed before we summarize the rest
+const URL_CAP = 100; // chars per url in the roster
 
 // ── eyes: AppleScript on the real Chrome ─────────────────────
 function osascript(script: string): string | null {
@@ -40,6 +46,35 @@ function activeTabJs(js: string): string | null {
   );
 }
 
+// ROSTER: every tab, every window — title + url only (no per-tab JS, so it's
+// cheap and doesn't need the Apple-Events toggle). Tab-separated rows:
+//   <window#>\t<title>\t<url>
+function chromeTabRoster(): string | null {
+  const out = osascript(
+    'tell application "Google Chrome"\n' +
+      'set out to ""\n' +
+      "set wi to 0\n" +
+      "repeat with w in windows\n" +
+      "set wi to wi + 1\n" +
+      "repeat with t in tabs of w\n" +
+      'set out to out & (wi as text) & tab & (title of t) & tab & (URL of t) & linefeed\n' +
+      "end repeat\n" +
+      "end repeat\n" +
+      "return out\n" +
+      "end tell",
+  );
+  if (!out) return null;
+  const lines = out.split("\n").filter(Boolean);
+  if (lines.length === 0) return null;
+  const fmt = lines.slice(0, TAB_CAP).map((line) => {
+    const [w = "?", title = "", url = ""] = line.split("\t");
+    const u = url.length > URL_CAP ? url.slice(0, URL_CAP) + "…" : url;
+    return `  [w${w}] ${title}  —  ${u}`;
+  });
+  const extra = lines.length > TAB_CAP ? `\n  … +${lines.length - TAB_CAP} more tabs` : "";
+  return `open tabs (${lines.length}):\n${fmt.join("\n")}${extra}`;
+}
+
 // ── hands: CDP against the Jarvis-owned profile ──────────────
 let browser: Browser | null = null;
 
@@ -65,11 +100,15 @@ const server = new McpServer({ name: "jarvis-browser", version: "0.1.0" });
 
 server.tool(
   "browser_context",
-  "What Rafe is looking at in HIS browser right now (read-only): active tab url/title, selection, visible text.",
+  "What Rafe is looking at in HIS browser (read-only): active tab url/title, selection, visible text, plus a roster of every open tab.",
   {},
   async () => {
     const info = activeTabInfo();
-    if (!info) return { content: [{ type: "text", text: "Chrome is not running (or has no window)" }] };
+    const roster = chromeTabRoster();
+    if (!info) {
+      if (roster) return { content: [{ type: "text", text: roster }] };
+      return { content: [{ type: "text", text: "Chrome is not running (or has no window)" }] };
+    }
     let body = `active tab: ${info.title}\nurl: ${info.url}`;
     const selection = activeTabJs("window.getSelection().toString().slice(0, 800)");
     if (selection) body += `\nselection: ${selection}`;
@@ -78,6 +117,7 @@ server.tool(
     else
       body +=
         "\n(page text unavailable — enable Chrome View → Developer → Allow JavaScript from Apple Events)";
+    if (roster) body += `\n\n${roster}`;
     return { content: [{ type: "text", text: body }] };
   },
 );

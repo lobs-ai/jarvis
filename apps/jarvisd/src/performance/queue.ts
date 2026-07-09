@@ -1,7 +1,10 @@
 import type { PerformanceItem } from "@jarvis/protocol";
 
-// Slack on top of an audio segment's real duration before the queue advances
-// without a played ack (send latency + playback start + scheduling).
+// After the last line's wall-clock pacing completes, wait this long for trailing
+// played-acks before judging whether the turn was heard. The browser plays a
+// beat behind the daemon's clock (send latency + onended lag, and that lag
+// accumulates across a long turn), so the final acks legitimately arrive after
+// the daemon has already advanced. Only bounds FAULT DETECTION, never pacing.
 const ACK_GRACE_MS = 3000;
 
 // Minimal structural interface; @jarvis/voice's ChatterboxTts satisfies it.
@@ -14,6 +17,10 @@ export interface QueueSink {
   sendItem(item: PerformanceItem): void;
   sendAudio(turnId: string, seq: number, pcm: Uint8Array): void;
   sendWarning(message: string): void;
+  // Is any stage tab actually connected? With no audience there is no playhead
+  // to pace to, so the performance advances on its own clock instead of holding
+  // the turn open waiting for acks that can never come.
+  hasAudience(): boolean;
 }
 
 export interface QueueOptions {
@@ -42,6 +49,16 @@ export class PerformanceQueue {
   private donePromise: Promise<void>;
   private resolveDone!: () => void;
 
+  // Fault detection is turn-level, not per-segment. One ack proves the stage is
+  // alive and playing, so we never fault a turn that got ANY ack — a late or
+  // drifted ack on a later line is playback lag, not a miss. Only a turn that
+  // sent audio to a present audience and got zero acks back is a real "nothing
+  // was heard" (dead tab, unarmed context), reported once.
+  private ackedAny = false;
+  private sentAudioSays = 0;
+  private lastAudioSay: PerformanceItem | null = null;
+  private faultChecked = false;
+
   // What was actually performed, for barge-in history truncation.
   readonly performed: PerformanceItem[] = [];
 
@@ -63,6 +80,7 @@ export class PerformanceQueue {
 
   // stage reports a say item finished playing
   ack(seq: number): void {
+    this.ackedAny = true; // proof of a live, playing audience — turn can't fault
     this.acks.get(seq)?.();
     this.acks.delete(seq);
   }
@@ -151,6 +169,7 @@ export class PerformanceQueue {
         this.prefetchTts();
       }
       this.resolveDone();
+      this.scheduleTurnFaultCheck();
     } finally {
       this.pumping = false;
       // handle items that arrived while we were finishing up
@@ -166,31 +185,60 @@ export class PerformanceQueue {
       sink.sendItem(item);
       if (pcm && pcm.byteLength > 0) {
         sink.sendAudio(item.turnId, item.seq, pcm);
-        // Wait until the stage reports playback finished — but a browser tab
-        // is not a reliable component: it can close mid-say, sleep, or not
-        // exist at all, and a turn must NEVER hang on a missing ack (a closed
-        // tab once wedged a turn for two hours). The audio's own duration
-        // (PCM16 mono @ 24kHz) plus grace bounds the wait; acks tighten
-        // pacing, the deadline guarantees liveness.
+        // PCM16 mono @ 24kHz → real-time playback duration of this segment.
         const durationMs = (pcm.byteLength / 2 / 24_000) * 1000;
-        await new Promise<void>((resolve) => {
-          const deadline = setTimeout(() => {
-            this.acks.delete(item.seq);
-            console.log(
-              `[queue] no played-ack for ${item.turnId}:${item.seq} after ${Math.round(durationMs + ACK_GRACE_MS)}ms — advancing`,
-            );
-            this.opts.onFault?.(item);
-            resolve();
-          }, durationMs + ACK_GRACE_MS);
-          this.acks.set(item.seq, () => {
-            clearTimeout(deadline);
-            resolve();
-          });
-        });
+        await this.paceSay(item, durationMs);
       }
       return;
     }
     // No-audio say (M0/quiet), and all directives: deliver immediately.
     sink.sendItem(item);
+  }
+
+  // Pace the performance to the audio's OWN real-time duration, NOT to the
+  // browser's played-ack. A browser tab is not a reliable clock — it can be
+  // asleep, closed, or mid-reconnect (a daemon restart drops every socket) — so
+  // the daemon advances on its own wall-clock and treats the ack as telemetry:
+  // an ack that arrives resolves the wait a touch early (real playback ended)
+  // and confirms the line was heard; an ack that never comes no longer stalls
+  // the turn. This is the fix for the "crawl" — the old code waited
+  // duration + grace PER segment when acks went missing, so a gone tab turned a
+  // 20s answer into minutes of dead air, advancing one timeout at a time.
+  private paceSay(item: PerformanceItem, durationMs: number): Promise<void> {
+    this.sentAudioSays++;
+    this.lastAudioSay = item;
+    // Empty room: nothing is playing this, so pacing to a playhead that doesn't
+    // exist only holds the turn open. Advance immediately; the end-of-turn check
+    // decides whether an audience that never acked is a real fault.
+    if (!this.opts.sink.hasAudience()) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const paceTimer = setTimeout(resolve, durationMs);
+      // The ack is telemetry: it resolves the wait a touch early when real
+      // playback ends, and (via ack()) marks the turn as heard. A missing ack
+      // never stalls — paceTimer already bounds the wait to the audio's length.
+      this.acks.set(item.seq, () => {
+        clearTimeout(paceTimer);
+        this.acks.delete(item.seq);
+        resolve();
+      });
+    });
+  }
+
+  // One tolerant, turn-level verdict after the performance drains: if we sent
+  // audio to a present audience and NOTHING was ever acked, the tab is dead or
+  // unarmed — nobody heard the turn — so report it once. A grace window lets the
+  // trailing acks (which lag the daemon's clock) land first; a single ack, even
+  // a late one, clears the whole turn. This replaces the old per-segment timers
+  // that fired spurious "line wasn't acknowledged" faults on ordinary lag.
+  private scheduleTurnFaultCheck(): void {
+    if (this.faultChecked) return;
+    this.faultChecked = true;
+    if (this.sentAudioSays === 0 || this.ackedAny) return; // no audio, or already proven heard
+    const timer = setTimeout(() => {
+      if (this.ackedAny || this.interrupted) return; // a trailing ack proved liveness
+      if (!this.opts.sink.hasAudience()) return; // empty room is not a fault
+      if (this.lastAudioSay) this.opts.onFault?.(this.lastAudioSay);
+    }, ACK_GRACE_MS);
+    timer.unref?.();
   }
 }

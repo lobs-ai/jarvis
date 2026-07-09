@@ -254,6 +254,23 @@ export class SubagentManager {
     }
   }
 
+  // New conversation = clean slate: stop every live subagent left over from the
+  // chat that just ended so its report and tool activity can't leak into the
+  // next one (they'd otherwise announce into it and note its tier-1 brain).
+  // Ambient drafts are exempt via exceptLabel — they exist precisely to run over
+  // a just-closed session and only surface as gated wiki proposals. Returns the
+  // number stopped.
+  stopLive(why: string, exceptLabel?: string): number {
+    let stopped = 0;
+    for (const sub of this.pool.values()) {
+      if (!isLive(sub.state)) continue;
+      if (exceptLabel !== undefined && sub.label === exceptLabel) continue;
+      this.close(sub, "closed", why);
+      stopped++;
+    }
+    return stopped;
+  }
+
   // ── internals ────────────────────────────────────────────────
   private mustGet(id: string): Subagent {
     const sub = this.pool.get(id);

@@ -38,6 +38,10 @@ export class MemoryStore {
   private eventSeq = 0; // monotonic within the session — the ordering key
   private turnSeq = 0; // turnIds are <sessionId>-<n>, unique across restarts
   private recent: ActivityEvent[] = [];
+  // turnIds of heartbeat turns this session — their events are invisible to
+  // the idle clock (awareness-heartbeat §2.9 Q6): a session kept "alive" only
+  // by its own heartbeats must still rotate, or ambient drafting never fires.
+  private heartbeatTurns = new Set<string>();
   lastEventAt = Date.now();
 
   constructor(
@@ -109,6 +113,7 @@ export class MemoryStore {
     this.eventSeq = 0;
     this.turnSeq = 0;
     this.recent = [];
+    this.heartbeatTurns.clear();
     writeFileSync(CURRENT_PATH, this.id + "\n", { mode: 0o600 });
     this.append({ kind: "session", phase: "begin", agent: "main" });
   }
@@ -126,7 +131,9 @@ export class MemoryStore {
     chmodSync(this.file, 0o600);
     this.recent.push(event);
     if (this.recent.length > RECENT_CAP) this.recent.splice(0, this.recent.length - RECENT_CAP);
-    this.lastEventAt = Date.now();
+    if (event.kind === "turn" && event.phase === "begin" && event.source === "heartbeat" && event.turn)
+      this.heartbeatTurns.add(event.turn);
+    if (!(event.turn && this.heartbeatTurns.has(event.turn))) this.lastEventAt = Date.now();
     return event;
   }
 

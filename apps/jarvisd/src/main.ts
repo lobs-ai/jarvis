@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { existsSync, readFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { join, extname, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import Anthropic from "@anthropic-ai/sdk";
@@ -52,6 +52,11 @@ const CLI_ALLOWED = [
   "mcp__tasks__subagent_result",
   "mcp__tasks__subagent_stop",
   "mcp__tasks__dispatch_background",
+  // the follow-through ledger (awareness-heartbeat Part 3): own-boundary,
+  // reversible, durable across conversations
+  "mcp__watch__watch_add",
+  "mcp__watch__watch_done",
+  "mcp__watch__watch_list",
 ];
 const CLI_DISALLOWED = [
   // file editing stays out — Jarvis is not a coding agent; the wiki gate would
@@ -65,6 +70,9 @@ const CLI_DISALLOWED = [
   "mcp__wiki__wiki_context",
   "mcp__terminal__terminal_context",
   "mcp__browser__browser_context",
+  // jarvisd assembles the bundle from *_context tools; the model never re-fetches
+  "mcp__workspace__workspace_context",
+  "mcp__watch__watch_context",
   "mcp__browser__browser_click",
   "mcp__browser__browser_type",
 ];
@@ -75,6 +83,23 @@ function hasClaudeCli(): boolean {
   } catch {
     return false;
   }
+}
+
+// Seconds since the last keyboard/mouse input, from IOKit (HIDIdleTime is
+// nanoseconds). null when unreadable — arrival detection just skips that tick.
+function hidIdleSeconds(): Promise<number | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "ioreg",
+      ["-c", "IOHIDSystem", "-d", "4"],
+      { encoding: "utf8", timeout: 5000, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) return resolve(null);
+        const m = stdout.match(/"HIDIdleTime"\s*=\s*(\d+)/);
+        resolve(m ? Number(m[1]) / 1e9 : null);
+      },
+    );
+  });
 }
 
 const MIME: Record<string, string> = {
@@ -109,6 +134,10 @@ async function main(): Promise<void> {
     { name: "wiki", command: TSX, args: [join(REPO_ROOT, "servers/wiki/src/index.ts")] },
     { name: "terminal", command: TSX, args: [join(REPO_ROOT, "servers/terminal/src/index.ts")] },
     { name: "browser", command: TSX, args: [join(REPO_ROOT, "servers/browser/src/index.ts")] },
+    // coworker loop (awareness-heartbeat Part 3): the lab-activity stream and
+    // the follow-through ledger — both contribute *_context to every bundle
+    { name: "workspace", command: TSX, args: [join(REPO_ROOT, "servers/workspace/src/index.ts")] },
+    { name: "watch", command: TSX, args: [join(REPO_ROOT, "servers/watch/src/index.ts")] },
     {
       name: "settings",
       command: TSX,
@@ -187,6 +216,9 @@ async function main(): Promise<void> {
   session.attachMcp(mcp, confirm);
   // the gate applies only while enabled — the word survives toggling off
   session.getWakeWord = () => (cfg.wake_enabled ? cfg.wake_word : "");
+  // coworker-loop knobs, read live from config
+  session.getSpeakCooldownMs = () => cfg.heartbeat_speak_cooldown_min * 60_000;
+  session.getQuietHours = () => cfg.quiet_hours;
 
   // Single appender for activity that originates OUTSIDE the session (subagent
   // fan-out): stamp via the store, broadcast the exact on-disk record.
@@ -271,6 +303,12 @@ async function main(): Promise<void> {
   // ── Session lifecycle (Layer 1 + 3) ───────────────────────────
   session.onSessionEnd = (closedId) => {
     brainRestartPending = false; // the reset already delivered any pending change
+    // Clean slate: stop the ended conversation's subagents before anything new
+    // spins up, so their reports and activity can't land in the next chat. The
+    // ambient draft is spared — it's dispatched just below as the deliberate
+    // post-session summarizer over this same closed transcript.
+    const stopped = subagents?.stopLive("new conversation", AMBIENT_LABEL) ?? 0;
+    if (stopped) console.log(`[session] stopped ${stopped} leftover subagent(s) from ${closedId}`);
     if (!cfg.ambient_drafting || !subagents) return;
     // Don't stack ambient drafts: if a prior one is still generating, skip this
     // one. Ambient drafting is best-effort (proposing nothing is fine), and two
@@ -318,6 +356,51 @@ async function main(): Promise<void> {
     brainRestartPending = false;
     restartBrain();
   };
+
+  // ── Awareness heartbeat (awareness-heartbeat §2) ───────────────
+  // The second clock: every heartbeat_min minutes, inject a synthetic
+  // bundle-carrying turn into the warm session so Jarvis stays aware between
+  // Rafe's utterances. Session.heartbeat() no-ops unless the room is idle;
+  // a deferred brain restart wins over a beat (the beat would land in a
+  // conversation that's about to be replaced).
+  const heartbeatMs = cfg.heartbeat_min * 60_000;
+  if (heartbeatMs > 0) {
+    const hb = setInterval(() => {
+      if (brainRestartPending) return;
+      session.heartbeat();
+    }, heartbeatMs);
+    hb.unref?.();
+  }
+
+  // ── Arrival beat (awareness-heartbeat Part 3) ──────────────────
+  // Presence from the Mac's HID idle clock (keyboard/mouse), not from open
+  // stage tabs — a tab left open overnight would mask every return. Poll each
+  // minute; idle ≥ AWAY_IDLE_S counts as away, and on the away→back edge, if
+  // the absence was long enough and a stage is open to hear it, fire the one
+  // beat that's allowed to speak first.
+  const AWAY_IDLE_S = 120;
+  if (cfg.arrival_min > 0) {
+    let awaySince: number | null = null;
+    const poll = setInterval(() => {
+      void hidIdleSeconds().then((idleS) => {
+        if (idleS === null) return;
+        if (idleS >= AWAY_IDLE_S) {
+          // backdate the absence to when input actually stopped
+          if (awaySince === null) awaySince = Date.now() - idleS * 1000;
+          return;
+        }
+        if (awaySince === null) return;
+        const awayMin = (Date.now() - awaySince) / 60_000;
+        awaySince = null;
+        if (awayMin < cfg.arrival_min) return;
+        if (brainRestartPending) return;
+        if (!sock.hasAudience()) return; // no stage open — nowhere to greet
+        console.log(`[arrival] back after ~${Math.round(awayMin)}m away`);
+        session.arrival(awayMin);
+      });
+    }, 60_000);
+    poll.unref?.();
+  }
 
   const applySettings = (raw: unknown): { settings: SettingsSnapshot; note?: string } => {
     const patch = SettingsPatch.parse(raw);
@@ -386,21 +469,25 @@ async function main(): Promise<void> {
   // endSession(), so ambient drafts fire exactly once however a session ends.
   sock.onSessionNew = () => session.endSession("button");
 
-  // Voice ports: degrade gracefully if a sidecar is down (captions carry the turn).
+  // Voice ports: degrade gracefully if a sidecar is down (captions carry the
+  // turn), and re-probe BOTH until they come up — the models load slowly on a
+  // cold start, and a port wired null at boot used to stay null forever (the
+  // old loop re-probed only TTS; /status showed stt healthy while the session
+  // couldn't hear).
   const stt = new WhisperStt(cfg.stt_url);
   const tts = new ChatterboxTts(cfg.tts_url, cfg.tts_voice);
-  const [sttOk, ttsOk] = await Promise.all([stt.healthy(), tts.healthy()]);
+  let [sttOk, ttsOk] = await Promise.all([stt.healthy(), tts.healthy()]);
   session.setVoicePorts(sttOk ? stt : null, ttsOk ? tts : null);
   console.log(`voice ports: stt=${sttOk ? "ok" : "DOWN"} tts=${ttsOk ? "ok" : "DOWN"}`);
-  if (!ttsOk) {
-    // TTS model load takes a while on cold start; re-probe until it comes up.
+  if (!sttOk || !ttsOk) {
     const probe = setInterval(() => {
-      void tts.healthy().then((ok) => {
-        if (ok) {
-          session.setVoicePorts(sttOk ? stt : null, tts);
-          console.log("voice ports: tts came up");
-          clearInterval(probe);
-        }
+      void Promise.all([sttOk || stt.healthy(), ttsOk || tts.healthy()]).then(([s, t]) => {
+        if (Boolean(s) === sttOk && Boolean(t) === ttsOk) return;
+        sttOk = Boolean(s);
+        ttsOk = Boolean(t);
+        session.setVoicePorts(sttOk ? stt : null, ttsOk ? tts : null);
+        console.log(`voice ports: stt=${sttOk ? "ok" : "DOWN"} tts=${ttsOk ? "ok" : "DOWN"}`);
+        if (sttOk && ttsOk) clearInterval(probe);
       });
     }, 5000);
   }

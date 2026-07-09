@@ -107,7 +107,7 @@ export class StageSocket implements SessionSink {
         const key = `${msg.turnId}:${msg.seq}`;
         if (this.ackedThisTurn.has(key)) break;
         this.ackedThisTurn.add(key);
-        session.ack(msg.seq);
+        session.ack(msg.turnId, msg.seq);
         break;
       }
       case "confirm":
@@ -198,7 +198,7 @@ export class StageSocket implements SessionSink {
     this.broadcast({ type: "barge", verdict });
   }
 
-  sendTurnBegin(turnId: string, source: "voice" | "text"): void {
+  sendTurnBegin(turnId: string, source: "voice" | "text" | "system" | "heartbeat"): void {
     this.ackedThisTurn.clear(); // new turn: seqs restart, so drop last turn's ack keys
     this.broadcast({ type: "turn.begin", turnId, source });
   }

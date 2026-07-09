@@ -39,7 +39,7 @@ const lightbox = new Lightbox();
 // the speakers), tell jarvisd — it folds faults into a corrective system turn
 // so the model fixes its own show without Rafe having to say "that broke".
 function reportFault(
-  kind: "exhibit-unresolved" | "missing-target" | "audio-blocked" | "audio-error",
+  kind: "exhibit-unresolved" | "missing-target" | "diagram-error" | "audio-blocked" | "audio-error",
   detail: string,
   turnId?: string,
 ): void {

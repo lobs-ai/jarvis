@@ -536,6 +536,9 @@ kbd {
   gap: 4px;
 }
 .turn.collapsed .turn-body { display: none; }
+/* heartbeat turns: quiet by design — render dim so the timeline stays scannable */
+.turn.hb > .turn-head { opacity: 0.55; }
+.turn.hb > .turn-head .turn-title { font-style: italic; }
 
 /* typed rows */
 .ar { animation: fadein 160ms ease-out; min-width: 0; }

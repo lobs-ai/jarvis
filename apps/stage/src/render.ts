@@ -140,15 +140,28 @@ const marked = new Marked(
   }),
 );
 
-export function renderMarkdown(el: HTMLElement, text: string): void {
+// Called once per mermaid block that fails to validate — lets the exhibit layer
+// feed the stage-fault loop so the model re-emits the diagram, corrected.
+export type DiagramErrorHandler = (message: string) => void;
+
+export function renderMarkdown(
+  el: HTMLElement,
+  text: string,
+  onDiagramError?: DiagramErrorHandler,
+): void {
   el.innerHTML = marked.parse(text, { async: false }) as string;
-  hydrateMermaid(el);
+  hydrateMermaid(el, onDiagramError);
 }
 
-export function renderCode(el: HTMLElement, text: string, lang?: string): void {
+export function renderCode(
+  el: HTMLElement,
+  text: string,
+  lang?: string,
+  onDiagramError?: DiagramErrorHandler,
+): void {
   if (lang === "mermaid") {
     el.innerHTML = `<pre><code class="language-mermaid">${escapeHtml(text)}</code></pre>`;
-    hydrateMermaid(el);
+    hydrateMermaid(el, onDiagramError);
     return;
   }
   const html =
@@ -160,32 +173,38 @@ export function renderCode(el: HTMLElement, text: string, lang?: string): void {
 
 // Replace every ```mermaid block under el with its rendered SVG, in place and
 // async — the exhibit conjures immediately, diagrams pop in as they compile.
-// A diagram that fails to parse keeps its source visible with the error below.
+// Each block is validated with mermaid.parse BEFORE it renders; a diagram that
+// fails to parse never draws a half-broken frame — it shows a "repairing"
+// placeholder and, via onDiagramError, feeds the stage-fault loop so the model
+// re-emits it corrected (malformed mermaid, stray fences, HTML leaking in, etc).
 let mermaidSeq = 0;
-function hydrateMermaid(el: HTMLElement): void {
+function hydrateMermaid(el: HTMLElement, onDiagramError?: DiagramErrorHandler): void {
   const blocks = el.querySelectorAll<HTMLElement>("code.language-mermaid");
   for (const code of blocks) {
     const source = code.textContent ?? "";
     const pre = code.closest("pre") ?? code;
     const id = `mmd-${++mermaidSeq}`;
-    void mermaid
-      .render(id, source)
-      .then(({ svg }) => {
+    void (async () => {
+      try {
+        await mermaid.parse(source); // validate first — throws on malformed source
+        const { svg } = await mermaid.render(id, source);
         const holder = document.createElement("div");
         holder.className = "mermaid-diagram";
         holder.innerHTML = svg;
         pre.replaceWith(holder);
-      })
-      .catch((err: unknown) => {
+      } catch (err: unknown) {
         document.getElementById(`d${id}`)?.remove(); // mermaid's leftover error node
         // A rebuild may have removed this bundle's lazy diagram chunk — reload
         // onto the current bundle rather than reporting a dead diagram.
         if (reloadOnChunkFailure(err)) return;
+        const message = String(err).replace(/^Error:\s*/, "").slice(0, 200);
         const note = document.createElement("div");
         note.className = "placeholder";
-        note.textContent = `diagram error: ${String(err).slice(0, 200)}`;
-        pre.after(note);
-      });
+        note.textContent = "diagram couldn't render — repairing…";
+        pre.replaceWith(note);
+        onDiagramError?.(message);
+      }
+    })();
   }
 }
 

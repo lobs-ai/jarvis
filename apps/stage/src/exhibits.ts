@@ -1,5 +1,5 @@
 import type { Exhibit } from "@jarvis/protocol";
-import { renderMarkdown, renderCode, escapeHtml } from "./render.js";
+import { renderMarkdown, renderCode, escapeHtml, type DiagramErrorHandler } from "./render.js";
 
 // Exhibit manager: conjure / update / sweep. Ids are namespaced by turn so a
 // model reusing "e1" across turns can't collide.
@@ -15,7 +15,7 @@ export class Exhibits {
     // something the model asked for didn't land on screen — feeds the
     // stage-fault loop so the model can repair its own show
     private readonly onFault?: (
-      kind: "exhibit-unresolved" | "missing-target",
+      kind: "exhibit-unresolved" | "missing-target" | "diagram-error",
       detail: string,
       turnId: string,
     ) => void,
@@ -65,7 +65,7 @@ export class Exhibits {
     const body = card.querySelector<HTMLElement>(".body");
     if (!body) return;
     const type = card.querySelector(".etype")?.textContent ?? "markdown";
-    this.render(body, { type, body: bodyText } as Exhibit);
+    this.render(body, { type, body: bodyText } as Exhibit, turnId);
   }
 
   dismiss(turnId: string, ref: string): void {
@@ -110,6 +110,21 @@ export class Exhibits {
 
   private render(body: HTMLElement, exhibit: Exhibit, turnId?: string): void {
     const content = "body" in exhibit ? exhibit.body : undefined;
+    // A ```mermaid fence that won't parse faults so the model re-emits it — but
+    // only for the model's own shows (wiki-browser turns are Rafe's browsing;
+    // reportFault drops those, so the callback is a harmless no-op there).
+    const onDiagramError = turnId
+      ? (message: string) => {
+          const label = exhibit.title ?? "untitled";
+          this.onFault?.(
+            "diagram-error",
+            `diagram in exhibit "${label}" failed to parse: ${message}. The mermaid source was ` +
+              `malformed — re-issue the <show> with corrected mermaid (a clean \`\`\`mermaid fence, ` +
+              `no stray backticks or HTML tags in the diagram body).`,
+            turnId,
+          );
+        }
+      : undefined;
     // by-reference exhibits resolve through jarvisd's /ref endpoint
     if (!content && exhibit.type !== "image" && exhibit.ref) {
       body.innerHTML = `<div class="placeholder">conjuring ${escapeHtml(exhibit.ref)}…</div>`;
@@ -117,7 +132,7 @@ export class Exhibits {
         .then(async (res) => {
           if (!res.ok) throw new Error(await res.text());
           const text = await res.text();
-          this.renderContent(body, exhibit.type, text);
+          this.renderContent(body, exhibit.type, text, undefined, onDiagramError);
         })
         .catch((err: unknown) => {
           this.placeholder(body, exhibit.ref);
@@ -136,7 +151,13 @@ export class Exhibits {
       case "code":
       case "diff": {
         if (content)
-          this.renderContent(body, exhibit.type, content, "lang" in exhibit ? exhibit.lang : undefined);
+          this.renderContent(
+            body,
+            exhibit.type,
+            content,
+            "lang" in exhibit ? exhibit.lang : undefined,
+            onDiagramError,
+          );
         else this.placeholder(body, exhibit.ref);
         return;
       }
@@ -157,10 +178,11 @@ export class Exhibits {
     type: "markdown" | "code" | "diff",
     text: string,
     lang?: string,
+    onDiagramError?: DiagramErrorHandler,
   ): void {
-    if (type === "markdown") renderMarkdown(body, text);
+    if (type === "markdown") renderMarkdown(body, text, onDiagramError);
     else if (type === "diff") body.innerHTML = renderDiff(text);
-    else renderCode(body, text, lang);
+    else renderCode(body, text, lang, onDiagramError);
   }
 
   // A well-formed ref that can't resolve yet renders a placeholder naming the

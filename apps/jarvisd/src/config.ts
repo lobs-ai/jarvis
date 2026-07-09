@@ -38,6 +38,28 @@ const ConfigSchema = z.object({
   // §II.6: tier-2 subagents get Bash by default (Rafe's call, 2026-07-03) —
   // observable via Activity, stoppable in one click. Off reverts to read-only.
   subagent_bash: z.boolean().default(true),
+  // Awareness heartbeat (docs/design/awareness-heartbeat.md §2): every N
+  // minutes an idle session gets a synthetic world-state turn so Jarvis stays
+  // up to date between utterances. 0 disables — the whole feature is
+  // dark-launchable, matching how wake_word="" disables the wake gate.
+  heartbeat_min: z.number().default(15),
+  // ── coworker loop (awareness-heartbeat Part 3) ────────────────
+  // The interrupt budget, tunable: at most one heartbeat-originated spoken
+  // line per this many minutes (was a hardcoded 30 in session.ts).
+  heartbeat_speak_cooldown_min: z.number().default(30),
+  // Quiet hours, "HH:MM-HH:MM" (24h, may wrap midnight, e.g. "23:00-08:00").
+  // Inside the window heartbeats are skipped entirely — no beats, no speech;
+  // arrival beats are exempt (sitting down at 2am is exactly when a brief is
+  // wanted). "" disables.
+  quiet_hours: z.string().default(""),
+  // Arrival beat: when the Mac's HID idle shows Rafe left for at least this
+  // many minutes and then came back, one beat fires that MAY greet him with a
+  // heads-up (watch items, workspace changes) — the "speaks first, correctly"
+  // moment. 0 disables.
+  arrival_min: z.number().default(45),
+  // Roots the workspace server scans for recently active git repos (the
+  // lab-activity stream). Read live by servers/workspace per refresh.
+  workspace_dirs: z.array(z.string()).default([join(homedir(), "other", "lobs")]),
 });
 export type Config = z.infer<typeof ConfigSchema>;
 

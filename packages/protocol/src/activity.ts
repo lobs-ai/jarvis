@@ -32,8 +32,10 @@ export const ActivityEvent = z.discriminatedUnion("kind", [
     ...base,
     kind: z.literal("turn"),
     phase: z.enum(["begin", "end"]),
-    // "system" = a jarvisd-minted announcement performance (background reports)
-    source: z.enum(["voice", "text", "system"]).optional(),
+    // "system" = a jarvisd-minted announcement performance (background reports);
+    // "heartbeat" = the periodic awareness turn — distinct so the activity view
+    // can chip/collapse it and the idle clock can ignore it
+    source: z.enum(["voice", "text", "system", "heartbeat"]).optional(),
     status: z.enum(["ok", "interrupted", "error"]).optional(),
   }),
   z.object({ ...base, kind: z.literal("heard"), text: z.string() }),

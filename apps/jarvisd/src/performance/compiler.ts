@@ -176,6 +176,12 @@ export class PerformanceCompiler {
     }
     if (name === "update") {
       if (!attrs.ref) return this.warn("update without ref");
+      const mermaidFault = firstMarkdownMermaidFault(payload);
+      if (mermaidFault) {
+        return this.warn(
+          `<update ref="${attrs.ref}">: ${mermaidFault} — dropped; re-issue with corrected mermaid`,
+        );
+      }
       this.events.onItem({
         kind: "update",
         seq: this.seq++,
@@ -209,6 +215,13 @@ export class PerformanceCompiler {
       d.ref !== undefined ||
       (d.type === "image" ? d.src !== undefined : d.body !== undefined);
     if (!hasContent) return this.warn(`<show id="${id}"> has neither ref nor payload`);
+    // Pre-flight any inline mermaid before it ships: a contaminated diagram would
+    // reach the stage and fail to draw. Drop it here so it never appears broken —
+    // the model re-issues via the directive-dropped fault loop.
+    const mermaidFault = firstExhibitMermaidFault(d);
+    if (mermaidFault) {
+      return this.warn(`<show id="${id}">: ${mermaidFault} — dropped; re-issue with corrected mermaid`);
+    }
     this.events.onItem({ kind: "show", seq: this.seq++, turnId: this.turnId, id, exhibit: d });
   }
 
@@ -228,4 +241,67 @@ function parseAttrs(tag: string): Record<string, string> {
 
 function stripUndefined(o: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined));
+}
+
+// ── mermaid pre-flight ──────────────────────────────────────────────────────
+// The stage feeds ```mermaid source verbatim to mermaid.parse; a stray closing
+// ``` fence or an HTML tag leaking in from a mis-terminated block makes it throw
+// and never draw (the class of failure Rafe kept hitting). We can't run mermaid
+// here — it needs a browser DOM — and validation must stay synchronous so it
+// doesn't stall the streamed performance. But these markers never appear in valid
+// mermaid, so a cheap structural check drops the bad directive before it ships;
+// the model then re-issues it, corrected, through the directive-dropped fault
+// loop. Genuine syntax errors that slip past are still caught by the stage's own
+// mermaid.parse (which also faults).
+const LEAKED_HTML =
+  /<\/(?:span|div|p|code|pre|section|article|main|body|html|ul|ol|li|table|thead|tbody|tr|td|th|blockquote|h[1-6])\b[^>]*>/i;
+
+function mermaidLint(source: string): string | null {
+  const body = source.trim();
+  if (!body) return "empty mermaid diagram";
+  if (body.includes("```")) return "a stray ``` fence leaked into the mermaid diagram";
+  const tag = body.match(LEAKED_HTML);
+  if (tag) return `a stray ${tag[0]} tag leaked into the mermaid diagram`;
+  return null;
+}
+
+// Slice the source of each ```mermaid fence out of a markdown payload the way the
+// stage's parser does: content runs from the opener to a line that is exactly ```
+// A mistyped closer (e.g. ```</span>) is NOT a clean close, so its junk stays in
+// the block and gets flagged — precisely the contamination we want to catch.
+function mermaidFences(markdown: string): string[] {
+  const blocks: string[] = [];
+  let buf: string[] | null = null;
+  for (const line of markdown.split("\n")) {
+    if (buf === null) {
+      if (/^[ \t]{0,3}```[ \t]*mermaid\b/i.test(line)) buf = [];
+      continue;
+    }
+    if (/^[ \t]{0,3}```[ \t]*$/.test(line)) {
+      blocks.push(buf.join("\n"));
+      buf = null;
+      continue;
+    }
+    buf.push(line);
+  }
+  if (buf !== null) blocks.push(buf.join("\n")); // unterminated fence: lint what's there
+  return blocks;
+}
+
+function firstMarkdownMermaidFault(markdown: string): string | null {
+  for (const block of mermaidFences(markdown)) {
+    const fault = mermaidLint(block);
+    if (fault) return fault;
+  }
+  return null;
+}
+
+function firstExhibitMermaidFault(d: Exhibit): string | null {
+  if (d.type === "code" && d.lang === "mermaid" && d.body !== undefined) {
+    return mermaidLint(d.body);
+  }
+  if (d.type === "markdown" && d.body !== undefined) {
+    return firstMarkdownMermaidFault(d.body);
+  }
+  return null;
 }

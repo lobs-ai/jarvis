@@ -28,7 +28,7 @@ export interface SessionSink {
   // acoustic barge verdict: "cut" drops the client's buffered TTS (a real
   // interrupt landed), "resume" un-ducks it (the barge was noise, keep talking).
   sendBarge(verdict: "cut" | "resume"): void;
-  sendTurnBegin(turnId: string, source: "voice" | "text" | "system"): void;
+  sendTurnBegin(turnId: string, source: "voice" | "text" | "system" | "heartbeat"): void;
   sendTurnEnd(turnId: string): void;
   sendHeard(turnId: string, text: string): void;
   sendThought(turnId: string, text: string): void;
@@ -62,12 +62,106 @@ const FAULT_DEBOUNCE_MS = 2_000;
 const FAULT_DEDUPE_MS = 10_000;
 const CORRECTIVE_COOLDOWN_MS = 60_000;
 
+// How long a finished turn's queue stays registered for ack routing past the
+// performance draining. Must exceed the queue's own ACK_GRACE_MS so trailing
+// played-acks still mark the turn heard before its fault check runs.
+const ACK_RETAIN_MS = 6_000;
+
+// Heartbeat (awareness-heartbeat §2): a periodic synthetic turn carries the
+// world-state bundle into the warm session so Jarvis stays aware between
+// Rafe's utterances. Silent by default — the prompt sets the speaking bar, and
+// the cooldown is jarvisd's hard backstop: at most one heartbeat-originated
+// spoken line per window (heartbeat_speak_cooldown_min); a muted beat's say is
+// swallowed into a next-turn note instead of audio ("it can't spam" is a
+// property of jarvisd, not a hope about the model).
+
+// Prepare-don't-commit norm (awareness-heartbeat §2.5a, decision j): an
+// unattended beat may read, analyze, and stage reversible own-boundary work,
+// but takes no committing or outward action. Not enforceable per-turn (tool
+// grants are set at child spawn), so it is a prompt norm — norm, not gate.
+const HEARTBEAT_PREPARE_NORM =
+  `This beat may PREPARE but not COMMIT: reading panes, tabs, files, and repos is fine, and so ` +
+  `is reversible own-boundary work — updating your watch list, staging a wiki proposal, ` +
+  `dispatching a read-only research subagent, drafting an answer for when Rafe looks up. Take ` +
+  `no committing or outward action: no side-effecting commands, no typing into panes, nothing ` +
+  `hard to reverse.`;
+
+// Every beat records its judgment (awareness-heartbeat §2.10 Q2): the verdict
+// line lands in the private workspace, is parsed at turn end, and becomes an
+// Activity note — so when the timing feels off, Rafe debugs the gate's
+// decisions instead of muting the feature.
+const BEAT_VERDICT_NORM =
+  `End your private (unspoken) text with exactly one line "verdict: silent — <short why>" or ` +
+  `"verdict: spoke — <short why>" so the call is auditable later.`;
+
+const HEARTBEAT_PROMPT =
+  `[heartbeat — automated, not from Rafe] A periodic check-in, not a question. Below is the ` +
+  `current state of Rafe's workspace — terminal panes, browser tabs, recently active repos, and ` +
+  `your standing watch items. Glance at it and update your understanding. Stay SILENT ` +
+  `(call no say) unless something changed that is genuinely worth interrupting a human for — a ` +
+  `build broke, a background agent finished or errored, an error you've now seen persist across ` +
+  `several beats, a watch item came due, or something Rafe is clearly waiting on just resolved. ` +
+  `Routine progress, cosmetic change, or "still working" is silence. If you do speak, one short ` +
+  `line. If this beat's evidence shows a watch item is done or moot, close it with watch_done — ` +
+  `a quiet close beats a spoken one. ` +
+  HEARTBEAT_PREPARE_NORM +
+  ` ` +
+  BEAT_VERDICT_NORM;
+
+const HEARTBEAT_PROMPT_MUTED =
+  `[heartbeat — automated, not from Rafe] A periodic check-in, not a question. Below is the ` +
+  `current state of Rafe's workspace. Glance at it and update your understanding. You are ` +
+  `rate-limited from speaking this beat — do NOT call say. If something urgent changed, note ` +
+  `it privately and raise it on Rafe's next real turn. Watch-list bookkeeping (watch_done on ` +
+  `an item you can see resolved) is still fine. ` +
+  HEARTBEAT_PREPARE_NORM +
+  ` ` +
+  BEAT_VERDICT_NORM;
+
+// Arrival beat (awareness-heartbeat Part 3): Rafe sat back down after a real
+// absence. The one beat that's EXPECTED to open its mouth — if there's
+// something worth knowing. Exempt from the speak cooldown; a spoken arrival
+// still stamps it, so ordinary beats stay quiet for the window after.
+const arrivalPrompt = (awayMinutes: number): string => {
+  const away =
+    awayMinutes >= 90 ? `${Math.round(awayMinutes / 60)} hours` : `${Math.round(awayMinutes)} minutes`;
+  return (
+    `[arrival — automated, not from Rafe] Rafe just sat back down after about ${away} away. ` +
+    `Below is the current state of his workspace. If something deserves a heads-up — a watch ` +
+    `item that resolved or came due while he was gone, a background agent that finished or ` +
+    `errored, a build that broke, or the thing he was clearly mid-way through — greet him with ` +
+    `ONE short spoken line (say), the useful fact first, no ceremony. If nothing clears that ` +
+    `bar, stay silent; never greet for greeting's sake. ` +
+    HEARTBEAT_PREPARE_NORM +
+    ` ` +
+    BEAT_VERDICT_NORM
+  );
+};
+
+// Silent-turn guarantee (§say-contract): a turn Rafe triggered by speaking or
+// typing MUST end in audible speech. When the brain slips into the coding-agent
+// wrap-up habit and ends in plain text, Rafe hears dead air. The completion path
+// bounces such a turn back with this corrective. It fires as a source="system"
+// turn — itself allowed to be silent — so the guarantee re-prompts at most once
+// and can never self-loop.
+const SILENT_TURN_CORRECTIVE =
+  `[silent-turn correction — automated, not from Rafe] Your last turn ended without calling the say ` +
+  `tool, so Rafe heard nothing — dead air in reply to something he said or typed. Answer him now, out ` +
+  `loud, by calling say. Say only what you would have said; do NOT re-run tools or actions that already ` +
+  `succeeded.`;
+
 // One conversation, one user — audience of one. Owns turn lifecycle, the
 // performance layer, and barge-in arbitration. Conversation history lives in
 // the BrainPort (Claude Code's warm session); the durable JSONL this class
 // feeds is a replayable projection for the STAGE, never the brain's memory.
 export class Session {
   private active: ActiveTurn | null = null;
+  // Played-acks route by turnId, not "the active turn": the browser plays a beat
+  // behind the daemon's clock, so a line's ack can arrive after its turn already
+  // went idle. Queues stay registered here through a short grace past whenDone so
+  // those trailing acks still reach the right queue (mark it heard, cancel its
+  // fault check) instead of being dropped and mistaken for a miss.
+  private queuesByTurn = new Map<string, PerformanceQueue>();
   private quiet = false;
   private micChunks: Uint8Array[] = [];
   // Layer 2: source of truth for "what is on the stage right now" — exhibits
@@ -83,6 +177,8 @@ export class Session {
   private faultTimer: ReturnType<typeof setTimeout> | null = null;
   private recentFaults = new Map<string, number>();
   private lastCorrectiveAt = 0;
+  // heartbeat speaking circuit breaker (mirrors lastCorrectiveAt)
+  private lastHeartbeatSpokeAt = 0;
 
   constructor(
     private readonly brain: BrainPort,
@@ -165,6 +261,15 @@ export class Session {
     this.pendingInterruptNote = null;
     this.liveExhibits.clear();
     this.openTools.clear();
+    // The stage-fault loop belongs to the conversation that's ending — cancel any
+    // debounced corrective turn and drop its dedupe state so a fault reported in
+    // the old chat can't fire a system turn into the fresh one.
+    if (this.faultTimer) clearTimeout(this.faultTimer);
+    this.faultTimer = null;
+    this.pendingFaults = [];
+    this.recentFaults.clear();
+    this.lastCorrectiveAt = 0;
+    this.lastHeartbeatSpokeAt = 0;
     const closedId = this.store.endSession(reason);
     // the brain sheds its history (CliBrain kills the warm child) and re-warms
     // so the next turn doesn't race MCP startup
@@ -189,6 +294,44 @@ export class Session {
       this.endSession("idle");
     }, 60_000);
     timer.unref?.();
+  }
+
+  // ── heartbeat (awareness-heartbeat §2) ───────────────────────
+  // The second clock: main fires this every ~heartbeat_min minutes. It injects
+  // a synthetic bundle-carrying turn into the same warm session, so every
+  // glance accumulates into the context the next real question will see. It
+  // must no-op unless the room is genuinely idle — injecting while a turn is
+  // active is the barge-in path, and a heartbeat never interrupts Rafe.
+  heartbeat(): void {
+    if (this.active) return; // a real turn is in flight
+    if (this.pendingAnnouncements.length > 0) return; // idle channel is busy speaking
+    if (!this.store.hasTurns) return; // never heartbeat an empty session
+    if (inQuietHours(this.getQuietHours())) return; // quiet hours: no beats at all
+    // Inside the speaking cooldown the model is TOLD it's rate-limited (more
+    // reliable than swallowing after the fact); the swallow in startTurn stays
+    // as the hard backstop either way.
+    void this.startTurn("heartbeat", this.heartbeatMuted() ? HEARTBEAT_PROMPT_MUTED : HEARTBEAT_PROMPT);
+  }
+
+  // Arrival (awareness-heartbeat Part 3): main fires this when the Mac's HID
+  // idle shows Rafe returned after a real absence. Rides the heartbeat source
+  // (bundle + invisibility to the idle clock + Activity chip) but skips the
+  // hasTurns guard — greeting a fresh session is the point — and is exempt
+  // from the speak cooldown (this beat exists to be allowed to speak).
+  arrival(awayMinutes: number): void {
+    if (this.active) return;
+    if (this.pendingAnnouncements.length > 0) return;
+    void this.startTurn("heartbeat", arrivalPrompt(awayMinutes), undefined, {
+      exemptFromSpeakCooldown: true,
+    });
+  }
+
+  // Both wired live from config by main (defaults match the old constants).
+  getSpeakCooldownMs: () => number = () => 30 * 60_000;
+  getQuietHours: () => string = () => "";
+
+  private heartbeatMuted(): boolean {
+    return Date.now() - this.lastHeartbeatSpokeAt < this.getSpeakCooldownMs();
   }
 
   private isEndPhrase(input: string): boolean {
@@ -311,6 +454,7 @@ export class Session {
         },
         sendAudio: (t, seq, pcm) => this.sink.sendAudio(t, seq, pcm),
         sendWarning: (m) => this.warn(m, turnId),
+        hasAudience: () => this.sink.hasAudience(),
       },
       ttsTextTransform: this.makePronunciationTransform(),
       onFault: (item) =>
@@ -320,6 +464,7 @@ export class Session {
           turnId,
         ),
     });
+    this.registerQueue(turnId, queue);
     queue.enqueue({ kind: "say", seq: 0, turnId, text });
     queue.enqueue({
       kind: "show",
@@ -451,12 +596,31 @@ export class Session {
     void this.startTurn("voice", transcript, t0);
   }
 
-  ack(seq: number): void {
-    this.active?.queue.ack(seq);
-    const say = this.active?.queue.performed.find(
-      (i) => i.kind === "say" && i.seq === seq,
-    );
-    if (say && say.kind === "say") this.active?.sayTextsPlayed.push(say.text);
+  ack(turnId: string, seq: number): void {
+    // Route to the queue that owns this turn — which may no longer be the active
+    // one (trailing ack after the turn went idle). Registration outlives the turn
+    // by a grace so these still land; see queuesByTurn.
+    const queue = this.queuesByTurn.get(turnId);
+    if (!queue) return;
+    queue.ack(seq);
+    // Barge-in last-words only matter for the turn still in flight.
+    if (this.active?.turnId === turnId) {
+      const say = queue.performed.find((i) => i.kind === "say" && i.seq === seq);
+      if (say && say.kind === "say") this.active.sayTextsPlayed.push(say.text);
+    }
+  }
+
+  // Register a queue for ack routing and schedule its removal a grace past the
+  // performance draining — long enough for the browser's trailing played-acks
+  // (which lag the daemon's clock) to arrive and settle the turn's fault check.
+  private registerQueue(turnId: string, queue: PerformanceQueue): void {
+    this.queuesByTurn.set(turnId, queue);
+    void queue.whenDone().then(() => {
+      const drop = setTimeout(() => {
+        if (this.queuesByTurn.get(turnId) === queue) this.queuesByTurn.delete(turnId);
+      }, ACK_RETAIN_MS);
+      drop.unref?.();
+    });
   }
 
   // ── stage-fault loop ─────────────────────────────────────────
@@ -598,10 +762,16 @@ export class Session {
   }
 
   private async startTurn(
-    source: "voice" | "text" | "system",
+    source: "voice" | "text" | "system" | "heartbeat",
     userText: string,
     perceivedStart?: number,
+    opts?: { exemptFromSpeakCooldown?: boolean },
   ): Promise<void> {
+    // Heartbeat speech backstop: inside the cooldown, a say the model emits
+    // anyway is swallowed into a next-turn note — never audio (§2.5e).
+    // Arrival beats are exempt: they exist to be allowed to speak.
+    const heartbeatMuted =
+      source === "heartbeat" && !opts?.exemptFromSpeakCooldown && this.heartbeatMuted();
     // New input during an active performance IS the barge-in path; an explicit
     // interrupt just before this input left its note pending.
     let interruptPrefix = "";
@@ -639,6 +809,7 @@ export class Session {
           this.sink.sendAudio(t, seq, pcm);
         },
         sendWarning: (m) => this.warn(m, turnId),
+        hasAudience: () => this.sink.hasAudience(),
       },
       ttsTextTransform: this.makePronunciationTransform(),
       onFault: (item) =>
@@ -650,7 +821,15 @@ export class Session {
     });
 
     const compiler = new PerformanceCompiler(turnId, {
-      onItem: (item) => queue.enqueue(item),
+      onItem: (item) => {
+        if (heartbeatMuted && item.kind === "say") {
+          this.noteForNextTurn(
+            `a rate-limited heartbeat wanted to say: "${item.text.slice(0, 200)}"`,
+          );
+          return; // the queue tolerates the seq gap — playback is index-based
+        }
+        queue.enqueue(item);
+      },
       // A directive the compiler rejects (bad ref scheme, malformed markup, a
       // <show> with no content) produces NOTHING on the stage and — unlike a
       // failed ref fetch — never reaches the stage to fault on its own. Feed it
@@ -660,9 +839,13 @@ export class Session {
     });
 
     this.active = { turnId, queue, abort, sayTextsPlayed: [] };
+    this.registerQueue(turnId, queue);
     this.openTools.clear();
     this.emitActivity({ kind: "turn", phase: "begin", source, turn: turnId, agent: "main" });
-    this.emitActivity({ kind: "heard", text: userText, turn: turnId, agent: "main" });
+    // A heartbeat's "userText" is a fixed synthetic prompt — recording it every
+    // beat would bloat the JSONL with boilerplate; the turn's source says it all.
+    if (source !== "heartbeat")
+      this.emitActivity({ kind: "heard", text: userText, turn: turnId, agent: "main" });
     this.sink.sendTurnBegin(turnId, source);
     if (source === "voice") this.sink.sendHeard(turnId, userText);
     this.sink.sendState("thinking");
@@ -691,8 +874,24 @@ export class Session {
     // system turn is about the stage, not the world — no bundle.
     const bundle = source === "system" ? null : await this.assembleBundle();
     const notes = this.pendingSystemNotes.splice(0).map((n) => `[${n}] `).join("");
+    // Say-tool reinforcement: the system prompt sets the silent-by-default
+    // contract, but the model still slips into ending a turn in plain text (the
+    // coding-agent wrap-up habit) — dead silence to Rafe. A per-turn reminder in
+    // the high-salience user-message position, right where his words land, holds
+    // the contract far better than prompt text alone. So we frame a real
+    // utterance as speech and close the turn's input with a say reminder — the
+    // last thing read before generation. Scoped to voice/text on the say-tool
+    // brain: heartbeat and fault turns aren't "from Rafe" and already carry their
+    // own say guidance; the stream brain has no say tool.
+    const framed = source === "voice" || source === "text";
+    const sayBrain = this.brain.kind === "cli";
+    const utterance = framed && sayBrain ? `The user just said: "${userText}"` : userText;
+    const sayReminder =
+      framed && sayBrain
+        ? "\n\nReply by calling the say tool — it is the only channel Rafe hears; a plain-text answer is silence."
+        : "";
     const composed =
-      notes + interruptPrefix + userText + (bundle ? `\n\n${bundle}` : "");
+      notes + interruptPrefix + utterance + (bundle ? `\n\n${bundle}` : "") + sayReminder;
 
     try {
       const result = await this.brain.turn(
@@ -704,7 +903,8 @@ export class Session {
               console.log(`[latency] first-token ${Date.now() - perceivedStart}ms`);
             }
             compiler.push(delta);
-            this.sink.sendState("speaking");
+            // a muted heartbeat's says are swallowed — never claim "speaking"
+            if (!heartbeatMuted) this.sink.sendState("speaking");
           },
           onToolStart: () => {
             this.sink.sendState("acting");
@@ -759,11 +959,38 @@ export class Session {
         // that land as a silent turn; surface it like a thrown error.
         this.failTurn(turnId, compiler, `brain result ${result.error}`);
       } else if (!result.aborted && this.active?.turnId === turnId) {
+        // A heartbeat that spoke stamps the circuit breaker: the next beats
+        // inside the cooldown get the rate-limited prompt + say-swallow.
+        // (Swallowed says never reach the queue, so a muted beat can't restamp.)
+        if (source === "heartbeat" && queue.totalSays > 0) this.lastHeartbeatSpokeAt = Date.now();
+        // Beat verdict → Activity: parse the "verdict: …" line the prompt asks
+        // for out of the private workspace, so every beat's speak/stay-silent
+        // call is a visible, greppable row — the gate is debuggable, not vibes.
+        if (source === "heartbeat") {
+          const stated = [...thought.matchAll(/verdict:\s*(.+)/gi)].pop()?.[1]?.trim();
+          const fallback = queue.totalSays > 0 ? "spoke (no reason stated)" : "silent (no reason stated)";
+          this.emitActivity({
+            kind: "note",
+            level: "info",
+            text: `beat verdict: ${(stated ?? fallback).slice(0, 200)}`,
+            turn: turnId,
+            agent: "main",
+          });
+        }
         this.active = null;
         this.openTools.clear();
         this.emitActivity({ kind: "turn", phase: "end", status: "ok", turn: turnId, agent: "main" });
         this.sink.sendTurnEnd(turnId);
         this.sink.sendState("idle");
+        // Silent-turn guarantee: Rafe spoke or typed, but this turn produced no
+        // say — he heard dead air. Bounce it back once as a system corrective
+        // that forces speech. System turns carry no such guarantee, so if the
+        // corrective is itself silent it just ends — no loop. Skip to an empty
+        // room (no one to hear the fix) or the stream brain (no say tool).
+        if (framed && sayBrain && queue.totalSays === 0 && this.sink.hasAudience()) {
+          void this.startTurn("system", SILENT_TURN_CORRECTIVE);
+          return;
+        }
         this.drainAnnouncements(); // channel just went idle
         this.onIdle?.();
       }
@@ -814,13 +1041,43 @@ export class Session {
 
   private makePronunciationTransform(): (text: string) => string {
     const map = this.store.pronunciationMap();
-    if (map.length === 0) return (t) => t;
+    // Always strip speech markup (captions keep the authored text); pronunciation
+    // substitutions run after, on the cleaned text.
     return (text) => {
-      let out = text;
+      let out = stripSpeechMarkup(text);
       for (const [from, to] of map) out = out.split(from).join(to);
       return out;
     };
   }
+}
+
+// say text is authored as prose, but the model still slips in markdown — *bold*,
+// `code`, [label](url), leading bullets/headers. Captions render fine as text, but
+// TTS VOCALIZES the punctuation ("star", "backtick"). Strip formatting markers from
+// the spoken text only, keeping the words. Underscores are left alone so snake_case
+// identifiers aren't mangled. Runs before pronunciation substitutions.
+export function stripSpeechMarkup(text: string): string {
+  return text
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1") // [label](url) → label
+    .replace(/`+([^`]+)`+/g, "$1") // `code` → code
+    .replace(/\*{1,3}(\S(?:.*?\S)?)\*{1,3}/g, "$1") // *em* **bold** ***both*** → inner
+    .replace(/[*`]/g, "") // stray/unbalanced asterisks and backticks
+    .replace(/^\s{0,3}(?:[-+]\s+|#{1,6}\s+|>\s+)/gm, "") // line-start bullets/headers/quotes
+    .replace(/[ \t]{2,}/g, " ")
+    .trimEnd();
+}
+
+// Quiet hours: "HH:MM-HH:MM" or "HH-HH" (24h), may wrap midnight
+// ("23:00-08:00"). Unparseable or empty specs read as "not quiet" — a typo in
+// config must never silently kill the heartbeat.
+export function inQuietHours(spec: string, now = new Date()): boolean {
+  const m = spec.trim().match(/^(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?$/);
+  if (!m) return false;
+  const start = Number(m[1]) * 60 + Number(m[2] ?? 0);
+  const end = Number(m[3]) * 60 + Number(m[4] ?? 0);
+  if (start === end) return false;
+  const t = now.getHours() * 60 + now.getMinutes();
+  return start < end ? t >= start && t < end : t >= start || t < end;
 }
 
 // normalized [0,1] RMS of 16-bit PCM; speech with AGC lands ≥ ~0.03

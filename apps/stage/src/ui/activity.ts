@@ -231,11 +231,16 @@ export class Activity {
     const el = document.createElement("div");
     el.className = "turn running";
     el.dataset.turn = turnId;
-    const chip = source === "voice" ? "🎙" : source === "system" ? "◍" : "⌨";
+    // heartbeat turns are usually silent glances — collapsed so a long idle
+    // session doesn't fill the panel with empty cards (design §2.7)
+    if (source === "heartbeat") el.classList.add("hb", "collapsed");
+    const chip =
+      source === "voice" ? "🎙" : source === "system" ? "◍" : source === "heartbeat" ? "♡" : "⌨";
+    const title = source === "system" ? "background report" : source === "heartbeat" ? "heartbeat" : "…";
     el.innerHTML =
       `<header class="turn-head">` +
       `<span class="turn-chip">${chip}</span>` +
-      `<span class="turn-title">${source === "system" ? "background report" : "…"}</span>` +
+      `<span class="turn-title">${title}</span>` +
       `<span class="turn-time">${stamp(at)}</span>` +
       `<span class="turn-dur"></span>` +
       `<span class="turn-dot"></span>` +

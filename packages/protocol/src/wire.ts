@@ -60,7 +60,13 @@ export const ClientMessage = z.discriminatedUnion("type", [
   // corrective system turn so the model can fix its own show unprompted
   z.object({
     type: z.literal("stage.fault"),
-    kind: z.enum(["exhibit-unresolved", "missing-target", "audio-blocked", "audio-error"]),
+    kind: z.enum([
+      "exhibit-unresolved",
+      "missing-target",
+      "diagram-error",
+      "audio-blocked",
+      "audio-error",
+    ]),
     detail: z.string().min(1).max(400),
     turnId: z.string().optional(),
   }),
@@ -80,11 +86,12 @@ export type OrbState = z.infer<typeof OrbState>;
 // jarvisd → stage
 export const ServerMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("state"), orb: OrbState }),
-  // "system" = a turn jarvisd itself initiated (stage-fault correction)
+  // "system" = a turn jarvisd itself initiated (stage-fault correction);
+  // "heartbeat" = the periodic awareness turn (silent by default)
   z.object({
     type: z.literal("turn.begin"),
     turnId: z.string(),
-    source: z.enum(["voice", "text", "system"]),
+    source: z.enum(["voice", "text", "system", "heartbeat"]),
   }),
   z.object({ type: z.literal("turn.end"), turnId: z.string() }),
   // live transcript of what STT heard (caption rail shows user side too)
